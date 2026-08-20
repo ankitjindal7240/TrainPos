@@ -54,8 +54,8 @@
                 <th>Status</th>
                 <th>Order ID</th>
                 <th>Vendor</th>
-                <th>Delivery Date</th>
-                <th>Delivery Time</th>
+                <th>Order Date</th>
+                <th>Order Time</th>
                 <th>Payment Type</th>
                 <th>Contact No</th>
                 <th>Train Info : Coach &amp; Seat</th>
@@ -65,7 +65,7 @@
             </thead>
             <tbody>
               {% for order in orders %}
-                {% with schedule=order.delivery_date|default:order.booking_date %}
+                {% with schedule=order.order_date %}
                   <tr class="order-row">
                     <td><button class="expand-button" type="button" aria-expanded="false" aria-controls="order-detail-{{ order.id }}" data-detail-id="order-detail-{{ order.id }}">⌄</button></td>
                     <td><span class="status-badge status-{{ order.status|lower }}">{{ order.get_status_display }}</span></td>
@@ -85,7 +85,7 @@
                         <div class="detail-section"><h2>Customer</h2><p><b>{{ order.customer.name }}</b><br>{{ order.customer.phone|default:"No phone available" }}</p></div>
                         <div class="detail-section"><h2>Order</h2><p><b>{{ order.order_number }}</b><br>{{ order.vendor.name }}</p></div>
                         <div class="detail-section"><h2>Journey</h2><p><b>{{ order.train.train_number }}{% if order.train.train_name %} · {{ order.train.train_name }}{% endif %}</b><br>Coach {{ order.coach|default:"—" }} · Seat {{ order.berth|default:"—" }}<br>PNR: {{ order.pnr|default:"Not available" }}</p></div>
-                        <div class="detail-section"><h2>Delivery &amp; status</h2><p>{% if schedule %}{{ schedule|date:"d M Y, H:i" }}{% else %}Not available{% endif %}<br>{{ order.get_payment_mode_display }} · {{ order.get_status_display }}</p></div>
+                        <div class="detail-section"><h2>Order &amp; status</h2><p>{% if schedule %}{{ schedule|date:"d M Y, H:i" }}{% else %}Not available{% endif %}<br>{{ order.get_payment_mode_display }} · {{ order.get_status_display }}</p></div>
                         <div class="detail-section items-section"><h2>Items</h2><ul>{% for item in order.items.all %}<li>{{ item.item_name }} <span>× {{ item.quantity }}</span></li>{% empty %}<li>No items available</li>{% endfor %}</ul></div>
                         <div class="detail-section financial-section"><h2>Financial information</h2><p>GST <b>₹{{ order.gst }}</b><br>Discount <b>₹{{ order.discount }}</b><br>Total <b>₹{{ order.total }}</b><br>Amount to collect <b>Not available</b></p></div>
                         <div class="detail-section"><h2>Remarks</h2><p>Not available</p></div>

@@ -10,10 +10,9 @@ def order_list(request):
     orders = (
         Order.objects.select_related("vendor", "customer", "train")
         .prefetch_related("items")
-        .filter(delivery_date__date=timezone.localdate())
+        .filter(order_date__date=timezone.localdate())
         .order_by(
-            F("delivery_date").desc(nulls_last=True),
-            F("booking_date").desc(nulls_last=True),
+            F("order_date").desc(nulls_last=True),
             "-created_at",
         )
     )
@@ -36,7 +35,7 @@ def bill_print(request, pk):
         Order.objects.select_related("vendor", "customer", "train").prefetch_related("items"),
         pk=pk,
     )
-    schedule = order.delivery_date or order.booking_date
+    schedule = order.order_date
 
     if not order.bill_printed:
         order.bill_printed = True

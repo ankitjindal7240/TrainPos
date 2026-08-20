@@ -83,7 +83,7 @@ def parse_railrestro_email(body):
     parser.close()
     text = " ".join("".join(parser.text_parts).split())
 
-    delivery_datetime = _find(r"Delivery Time:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", text)
+    delivery_date = _find(r"Delivery Time:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", text)
     delivery_time = _find(r"Delivery Time:\s*\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2})", text)
     train_number = _find(r"TRAIN:\s*([A-Za-z0-9]+)\s*/", text)
     coach = _find(r"Coact/Seat:\s*([A-Za-z0-9]+)\s*-", text)
@@ -107,8 +107,7 @@ def parse_railrestro_email(body):
         "train_number": train_number,
         "coach": coach,
         "berth": berth,
-        "order_date": delivery_datetime,
-        "order_time": delivery_time,
+        "order_date": f"{delivery_date} {delivery_time}" if delivery_date and delivery_time else None,
         "payment_mode": payment_mode,
         "advance": advance,
         "gst": _find_amount("GST", text),

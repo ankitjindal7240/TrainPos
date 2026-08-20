@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 
@@ -70,6 +71,14 @@ def _extract_items(rows):
     return items
 
 
+def _normalized_order_datetime(date_value, time_value):
+    if not date_value or not time_value:
+        return None
+    return datetime.strptime(
+        f"{date_value} {time_value}", "%d %b %Y %H:%M"
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def parse_homebytes_email(body):
     """Return the V1 receipt fields from one saved HomeBytes email body."""
     parser = _HomeBytesHtmlParser()
@@ -77,8 +86,6 @@ def parse_homebytes_email(body):
     parser.close()
     text = " ".join("".join(parser.text_parts).split())
 
-    order_date = _find(r"Booking Date:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}),", text)
-    order_time = _find(r"Booking Date:\s*\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*(\d{1,2}:\d{2})", text)
     delivery_date = _find(r"Delivery Date:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}),", text)
     delivery_time = _find(r"Delivery Date:\s*\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s*(\d{1,2}:\d{2})", text)
     payment_mode = _find(r"Payment:\s*(PRE_PAID|CASH_ON_DELIVERY)", text)
@@ -101,10 +108,7 @@ def parse_homebytes_email(body):
         "train_number": _find(r"Train:\s*([A-Za-z0-9]+)\s*/", text),
         "coach": _find(r"Coach\s*/\s*Berth:\s*(.*?)\s+/\s+", text),
         "berth": _find(r"Coach\s*/\s*Berth:\s*.*?\s*/\s*([A-Za-z0-9]+)\s+Train:", text),
-        "order_date": order_date,
-        "order_time": order_time,
-        "delivery_date": delivery_date,
-        "delivery_time": delivery_time,
+        "order_date": _normalized_order_datetime(delivery_date, delivery_time),
         "payment_mode": payment_mode,
         "advance": advance,
         "gst": _find_amount("GST (5%)", text),

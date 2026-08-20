@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 
@@ -101,6 +102,14 @@ def _extract_items(rows):
     return items
 
 
+def _normalized_order_datetime(date_value, time_value):
+    if not date_value or not time_value:
+        return None
+    return datetime.strptime(
+        f"{date_value} {time_value}", "%b %d, %Y %H:%M"
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def parse_railrecipe_email(body):
     """Return the V1 receipt fields from one saved RailRecipe email body."""
     parser = _RailRecipeHtmlParser()
@@ -124,6 +133,9 @@ def parse_railrecipe_email(body):
         advance = None
         amount_to_collect = None
 
+    order_date = _find(r"Order Date\s*([A-Za-z]{3}\s+\d{1,2},\s*\d{4})", text)
+    order_time = _find(r"Delivery Time\s*\(ETA\).*?\s+(\d{1,2}:\d{2})\s+Journey Date", text)
+
     return {
         "order_number": _find(r"Order No\.\s*([A-Za-z0-9-]+)", text),
         "customer_name": None,
@@ -131,8 +143,7 @@ def parse_railrecipe_email(body):
         "train_number": _find(r"Train No\.\s*([A-Za-z0-9]+)", text),
         "coach": _find(r"Coach/Seat\s*([A-Za-z0-9]+)\s*/", text),
         "berth": _find(r"Coach/Seat\s*[A-Za-z0-9]+\s*/\s*([A-Za-z0-9]+)", text),
-        "order_date": _find(r"Order Date\s*([A-Za-z]{3}\s+\d{1,2},\s*\d{4})", text),
-        "order_time": _find(r"Delivery Time\s*\(ETA\).*?\s+(\d{1,2}:\d{2})\s+Journey Date", text),
+        "order_date": _normalized_order_datetime(order_date, order_time),
         "payment_mode": payment_mode,
         "advance": advance,
         "gst": _find_amount("GST", text),

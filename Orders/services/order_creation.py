@@ -7,10 +7,6 @@ from django.utils import timezone
 from Orders.models import Customer, IncomingEmail, Order, OrderItem, Train
 
 
-DATE_FORMATS = ("%Y-%m-%d", "%d %b %Y", "%b %d, %Y")
-TIME_FORMATS = ("%H:%M:%S", "%H:%M")
-
-
 def _to_decimal(value):
     if value is None or value == "":
         return Decimal("0")
@@ -20,22 +16,15 @@ def _to_decimal(value):
         raise ValueError(f"Invalid monetary value: {value}") from error
 
 
-def _parse_order_datetime(order_date, order_time):
-    if not order_date or not order_time:
+def _parse_order_datetime(order_date):
+    if not order_date:
         return None
-
-    for date_format in DATE_FORMATS:
-        for time_format in TIME_FORMATS:
-            try:
-                value = datetime.strptime(
-                    f"{order_date} {order_time}",
-                    f"{date_format} {time_format}",
-                )
-                return timezone.make_aware(value)
-            except ValueError:
-                continue
-
-    raise ValueError(f"Unsupported order date/time: {order_date} {order_time}")
+    if isinstance(order_date, datetime):
+        return timezone.make_aware(order_date) if timezone.is_naive(order_date) else order_date
+    try:
+        return timezone.make_aware(datetime.fromisoformat(str(order_date)))
+    except ValueError as error:
+        raise ValueError(f"Unsupported order date/time: {order_date}") from error
 
 
 def _get_customer(data):
@@ -133,12 +122,7 @@ def create_order_from_incoming_email(incoming_email, data):
                 coach=(data.get("coach") or "").strip(),
                 berth=(data.get("berth") or "").strip(),
                 delivery_station=(data.get("delivery_station") or "").strip(),
-                booking_date=_parse_order_datetime(
-                    data.get("order_date"), data.get("order_time")
-                ),
-                delivery_date=_parse_order_datetime(
-                    data.get("delivery_date"), data.get("delivery_time")
-                ),
+                order_date=_parse_order_datetime(data.get("order_date")),
                 payment_mode=payment_mode,
                 subtotal=_to_decimal(data.get("subtotal")),
                 gst=_to_decimal(data.get("gst")),

@@ -9,6 +9,9 @@ from django.utils import timezone
 from Orders.models import Customer, IncomingEmail, Order, Train, Vendor
 from Orders.management.commands.poll_gmail_orders import Command
 from Orders.parsers.homebytes import parse_homebytes_email
+from Orders.parsers.railrecipe import parse_railrecipe_email
+from Orders.parsers.railrestro import parse_railrestro_email
+from Orders.parsers.rajbhog_khana import parse_rajbhog_khana_email
 from Orders.services.order_creation import create_order_from_incoming_email
 
 
@@ -47,8 +50,7 @@ class OrderCreationServiceTests(TestCase):
             "train_name": "MEWAR EXPRESS",
             "coach": "B2",
             "berth": "36",
-            "order_date": "2026-08-11",
-            "order_time": "22:13:00",
+            "order_date": "2026-08-11 22:13:00",
             "payment_mode": payment_mode,
             "gst": Decimal("15.00"),
             "discount": Decimal("0.00"),
@@ -122,22 +124,22 @@ class OrderCreationServiceTests(TestCase):
         )
         self.assertIn("Invalid item quantity", incoming_email.error_message)
 
-    def test_order_list_contains_only_todays_delivery_orders(self):
+    def test_order_list_contains_only_todays_orders(self):
         today_email = self._email("HomeBytes", "today-order")
         today_order = create_order_from_incoming_email(
             today_email,
             self._data("TODAY-ORDER"),
         )
-        today_order.delivery_date = timezone.now()
-        today_order.save(update_fields=["delivery_date"])
+        today_order.order_date = timezone.now()
+        today_order.save(update_fields=["order_date"])
 
         older_email = self._email("RailRestro", "older-order")
         older_order = create_order_from_incoming_email(
             older_email,
             self._data("OLDER-ORDER", "CASH_ON_DELIVERY"),
         )
-        older_order.delivery_date = timezone.now() - timedelta(days=1)
-        older_order.save(update_fields=["delivery_date"])
+        older_order.order_date = timezone.now() - timedelta(days=1)
+        older_order.save(update_fields=["order_date"])
 
         response = self.client.get(reverse("order_list"))
 
@@ -159,7 +161,7 @@ class OrderCreationServiceTests(TestCase):
         self.assertTrue(order.bill_printed)
         self.assertIsNotNone(order.bill_printed_at)
 
-    def test_homebytes_delivery_datetime_is_saved_to_order(self):
+    def test_homebytes_operational_datetime_is_saved_to_order(self):
         body = """
             Booking Date: 20 Aug 2026, 14:17<br>
             Delivery Date: 20 Aug 2026, 15:00<br>
@@ -177,11 +179,50 @@ class OrderCreationServiceTests(TestCase):
 
         order = create_order_from_incoming_email(incoming_email, parsed)
 
-        self.assertEqual(parsed["delivery_date"], "20 Aug 2026")
-        self.assertEqual(parsed["delivery_time"], "15:00")
+        self.assertEqual(parsed["order_date"], "2026-08-20 15:00:00")
         self.assertEqual(
-            order.delivery_date,
+            order.order_date,
             timezone.make_aware(datetime(2026, 8, 20, 15, 0)),
+        )
+
+    def test_all_vendor_parsers_return_one_normalized_order_date(self):
+        invoice_body = """
+            Booking Date: 20 Aug 2026, 14:17<br>
+            Delivery Date: 20 Aug 2026, 15:00<br>
+            Customer Name : Radha Krishna<br>
+            Customer Contact : 9462623238<br>
+            Invoice HB001260544 / 2470000000<br>
+            Payment: PRE_PAID<br>
+            Coach / Berth: B2 / 36<br>
+            Train: 12963 / MEWAR EXPRESS
+        """
+        railrestro_body = """
+            ORDER #: 5759908 Customer: Mamta M. 6364385972
+            TRAIN: 22975 / SAURASHTRA JANTA EXP
+            Delivery Time: 2026-08-20 20:05:00
+            Coact/Seat: S1-37
+        """
+        railrecipe_body = """
+            Order No. RR-100 Mobile No. 9462623238 Train No. 12963
+            Coach/Seat B2 / 36 Order Date Aug 20, 2026
+            Delivery Time (ETA) Kota 15:00 Journey Date
+            PAYMENT STATUS PREPAID
+        """
+
+        self.assertEqual(
+            parse_homebytes_email(invoice_body)["order_date"], "2026-08-20 15:00:00"
+        )
+        self.assertEqual(
+            parse_rajbhog_khana_email(invoice_body)["order_date"],
+            "2026-08-20 15:00:00",
+        )
+        self.assertEqual(
+            parse_railrestro_email(railrestro_body)["order_date"],
+            "2026-08-20 20:05:00",
+        )
+        self.assertEqual(
+            parse_railrecipe_email(railrecipe_body)["order_date"],
+            "2026-08-20 15:00:00",
         )
 
     def test_gmail_poll_recovers_offline_email_and_skips_it_on_next_cycle(self):
