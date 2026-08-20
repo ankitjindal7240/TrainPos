@@ -1,0 +1,107 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrainPOS Orders</title>
+  <link rel="stylesheet" href="{% static 'Orders/css/order_list.css' %}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="{% url 'order_list' %}"><span class="brand-mark">▣</span>TrainPOS</a>
+      <div class="account"><span class="account-icon">⌂</span><span><strong>Food Costa</strong><small>Admin</small></span></div>
+      <nav class="side-nav" aria-label="Main navigation">
+        <span class="nav-item">▦ <span>Dashboard</span></span>
+        <a class="nav-item active" href="{% url 'order_list' %}">▤ <span>Orders</span></a>
+        <span class="nav-item">♧ <span>KOT</span></span>
+        <span class="nav-item">♙ <span>Customers</span></span>
+        <span class="nav-item">▧ <span>Trains</span></span>
+        <span class="nav-item">▣ <span>Vendors</span></span>
+        <span class="nav-item">▥ <span>Reports</span></span>
+        <span class="nav-item">⚙ <span>Settings</span></span>
+      </nav>
+      <span class="collapse-menu">‹ <span>Collapse Menu</span></span>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div><h1>Orders</h1><p>Manage all incoming orders</p></div>
+        <div class="topbar-tools" aria-label="Visual controls">
+          <span class="search-placeholder">Search orders, PNR, phone, train... <b>⌕</b></span>
+          <span class="tool-button">☷</span>
+          <span class="date-placeholder">▣ 12 Aug 2026 - 13 Aug 2026</span>
+          <span class="bell">♧<i>12</i></span>
+          <span class="profile">A</span><span class="admin-label">Admin⌄</span>
+        </div>
+      </header>
+
+      <section class="summary-grid" aria-label="Order summary">
+        <article class="summary-card"><span class="summary-icon total">▥</span><div><strong>{{ summary.total_orders }}</strong><small>Total Orders</small></div></article>
+        <article class="summary-card"><span class="summary-icon new">✓</span><div><strong>{{ summary.new_orders }}</strong><small>New</small></div></article>
+        <article class="summary-card"><span class="summary-icon preparing">◷</span><div><strong>{{ summary.preparing_orders }}</strong><small>Preparing</small></div></article>
+        <article class="summary-card"><span class="summary-icon ready">♧</span><div><strong>{{ summary.ready_orders }}</strong><small>Ready</small></div></article>
+        <article class="summary-card"><span class="summary-icon cancelled">×</span><div><strong>{{ summary.cancelled_orders }}</strong><small>Cancelled</small></div></article>
+      </section>
+
+      <section class="orders-panel">
+        {% if orders %}
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th aria-label="Expand"></th>
+                <th>Status</th>
+                <th>Order ID</th>
+                <th>Vendor</th>
+                <th>Delivery Date</th>
+                <th>Delivery Time</th>
+                <th>Payment Type</th>
+                <th>Contact No</th>
+                <th>Train Info : Coach &amp; Seat</th>
+                <th>Remarks</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for order in orders %}
+                {% with schedule=order.delivery_date|default:order.booking_date %}
+                  <tr class="order-row">
+                    <td><button class="expand-button" type="button" aria-expanded="false" aria-controls="order-detail-{{ order.id }}" data-detail-id="order-detail-{{ order.id }}">⌄</button></td>
+                    <td><span class="status-badge status-{{ order.status|lower }}">{{ order.get_status_display }}</span></td>
+                    <td class="order-id">{{ order.order_number }}</td>
+                    <td>{{ order.vendor.name }}</td>
+                    <td>{% if schedule %}{{ schedule|date:"d-m-Y" }}{% else %}—{% endif %}</td>
+                    <td>{% if schedule %}{{ schedule|date:"H:i" }}{% else %}—{% endif %}</td>
+                    <td>{% if order.payment_mode == 'CASH_ON_DELIVERY' %}<span class="payment-badge cod">COD</span>{% else %}<span class="payment-badge online">ONLINE</span>{% endif %}</td>
+                    <td>{{ order.customer.phone|default:"—" }}</td>
+                    <td><strong>{{ order.train.train_number }}</strong>{% if order.train.train_name %} · {{ order.train.train_name }}{% endif %} <span class="seat">{{ order.coach|default:"—" }}-{{ order.berth|default:"—" }}</span></td>
+                    <td>—</td>
+                    <td><span class="actions"><button type="button" aria-label="Send order">➤</button><a class="bill-button{% if order.bill_printed %} bill-printed{% endif %}" href="{% url 'order_bill' order.pk %}" target="_blank" aria-label="Print bill"{% if order.bill_printed %} title="Bill already printed"{% endif %}>{% if order.bill_printed %}✓{% else %}▣{% endif %}</a><button type="button" aria-label="KOT">KOT</button><button type="button" aria-label="Edit order">✎</button></span></td>
+                  </tr>
+                  <tr class="order-detail-row" id="order-detail-{{ order.id }}" hidden>
+                    <td colspan="11">
+                      <div class="order-detail">
+                        <div class="detail-section"><h2>Customer</h2><p><b>{{ order.customer.name }}</b><br>{{ order.customer.phone|default:"No phone available" }}</p></div>
+                        <div class="detail-section"><h2>Order</h2><p><b>{{ order.order_number }}</b><br>{{ order.vendor.name }}</p></div>
+                        <div class="detail-section"><h2>Journey</h2><p><b>{{ order.train.train_number }}{% if order.train.train_name %} · {{ order.train.train_name }}{% endif %}</b><br>Coach {{ order.coach|default:"—" }} · Seat {{ order.berth|default:"—" }}<br>PNR: {{ order.pnr|default:"Not available" }}</p></div>
+                        <div class="detail-section"><h2>Delivery &amp; status</h2><p>{% if schedule %}{{ schedule|date:"d M Y, H:i" }}{% else %}Not available{% endif %}<br>{{ order.get_payment_mode_display }} · {{ order.get_status_display }}</p></div>
+                        <div class="detail-section items-section"><h2>Items</h2><ul>{% for item in order.items.all %}<li>{{ item.item_name }} <span>× {{ item.quantity }}</span></li>{% empty %}<li>No items available</li>{% endfor %}</ul></div>
+                        <div class="detail-section financial-section"><h2>Financial information</h2><p>GST <b>₹{{ order.gst }}</b><br>Discount <b>₹{{ order.discount }}</b><br>Total <b>₹{{ order.total }}</b><br>Amount to collect <b>Not available</b></p></div>
+                        <div class="detail-section"><h2>Remarks</h2><p>Not available</p></div>
+                      </div>
+                    </td>
+                  </tr>
+                {% endwith %}
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state"><h2>No orders yet</h2><p>Orders created from vendor emails will appear here.</p></div>
+        {% endif %}
+      </section>
+    </main>
+  </div>
+  <script src="{% static 'Orders/js/order_list.js' %}"></script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bill {{ order.order_number }}</title>
+  <link rel="stylesheet" href="{% static 'Orders/css/bill_print.css' %}">
+</head>
+<body>
+  <main class="receipt">
+    <header class="receipt-header">
+      <h1>Train Order</h1>
+      <strong>Food Costa</strong>
+      <span>{{ restaurant_phone }}</span>
+    </header>
+
+    <section class="order-information">
+      <dl>
+        <dt>Order No.</dt><dd>{{ order.order_number }}</dd>
+        <dt>Vendor</dt><dd>{{ order.vendor.name }}</dd>
+        <dt>Date</dt><dd>{% if schedule %}{{ schedule|date:"M d, Y" }}{% else %}—{% endif %}</dd>
+        <dt>Time</dt><dd>{% if schedule %}{{ schedule|date:"H : i" }}{% else %}—{% endif %}</dd>
+        <dt>Customer Name</dt><dd>{{ order.customer.name }}</dd>
+        <dt>Mobile</dt><dd>{{ order.customer.phone|default:"—" }}</dd>
+      </dl>
+    </section>
+
+    <section class="items-section">
+      <div class="items-heading"><strong>Item</strong><strong>Qty</strong></div>
+      {% for item in order.items.all %}
+        <div class="item-line"><span>{{ item.item_name }}</span><span>{{ item.quantity }}</span></div>
+      {% empty %}
+        <div class="item-line"><span>No items available</span><span>—</span></div>
+      {% endfor %}
+    </section>
+
+    <section class="financial-section">
+      <dl>
+        <dt>Remarks:</dt><dd>Not available</dd>
+        <dt>Advance:</dt><dd>₹ {{ advance }}</dd>
+        <dt>GST:</dt><dd>₹ {{ order.gst }}</dd>
+        <dt>Tax:</dt><dd>₹ {{ tax }}</dd>
+        <dt>Discount:</dt><dd>₹ {{ order.discount }}</dd>
+        <dt>Total:</dt><dd>₹ {{ order.total }}</dd>
+        <dt>Amount to collect:</dt><dd>₹ {{ amount_to_collect }}</dd>
+      </dl>
+    </section>
+
+    <section class="payment-train-box">
+      <div class="payment-mode">{{ payment_label }}</div>
+      <div class="journey-summary">
+        <div><span>Train number</span><strong>{{ order.train.train_number }}</strong></div>
+        <div><span>Coach / berth</span><strong>{{ order.coach|default:"—" }} / {{ order.berth|default:"—" }}</strong></div>
+      </div>
+    </section>
+  </main>
+  <script src="{% static 'Orders/js/bill_print.js' %}"></script>
+</body>
+</html>
