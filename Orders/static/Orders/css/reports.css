@@ -1,0 +1,22 @@
+.reports-content { padding-bottom: 48px; }
+.report-period-panel, .vendor-breakdown { margin-bottom: 22px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 3px 12px rgba(20,37,70,.03); }
+.report-period-panel { padding: 18px 20px; }
+.period-form { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.period-form label { color: #526078; font-weight: 700; }
+.period-form select, .period-form input { min-height: 38px; padding: 0 10px; border: 1px solid #dbe2ed; border-radius: 7px; color: #27334a; background: #fff; }
+.period-form button { min-height: 38px; padding: 0 17px; border: 0; border-radius: 7px; background: #2876ed; color: #fff; font-weight: 700; cursor: pointer; }
+.custom-date-fields { display: flex; align-items: center; gap: 8px; }
+.period-description { margin: 13px 0 0; color: #7b8494; }
+.validation-error { margin: 10px 0 0; color: #bf3040; font-weight: 700; }
+.report-summary-grid { grid-template-columns: repeat(4, 1fr); }
+.summary-card strong { white-space: nowrap; }
+.vendor-breakdown { overflow: hidden; }
+.vendor-breakdown summary { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; color: #142c54; font-size: 16px; font-weight: 700; cursor: pointer; }
+.vendor-breakdown summary span { color: #8a94a4; font-size: 13px; font-weight: 400; }
+.vendor-table-wrap { padding: 0 20px 20px; }
+.vendor-table { width: 100%; border-collapse: collapse; }
+.vendor-table th { padding: 13px 12px; background: var(--navy); color: #edf4ff; font-size: 13px; text-align: left; }
+.vendor-table th:first-child { border-radius: 7px 0 0 7px; }.vendor-table th:last-child { border-radius: 0 7px 7px 0; }
+.vendor-table td { padding: 14px 12px; border-bottom: 1px solid var(--line); color: #4b5364; }
+.vendor-table td:first-child { color: #26334d; font-weight: 700; }.no-report-data { text-align: center; color: #7b8494 !important; }
+@media (max-width: 850px) { .report-summary-grid { grid-template-columns: repeat(2, 1fr); }.custom-date-fields { width: 100%; flex-wrap: wrap; } }

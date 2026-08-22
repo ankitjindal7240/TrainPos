@@ -1,0 +1,82 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrainPOS Reports</title>
+  <link rel="stylesheet" href="{% static 'Orders/css/order_list.css' %}">
+  <link rel="stylesheet" href="{% static 'Orders/css/reports.css' %}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="{% url 'order_list' %}"><span class="brand-mark">▣</span>TrainPOS</a>
+      <div class="account"><span class="account-icon">⌂</span><span><strong>Food Costa</strong><small>Admin</small></span></div>
+      <nav class="side-nav" aria-label="Main navigation">
+        <span class="nav-item">▦ <span>Dashboard</span></span>
+        <a class="nav-item" href="{% url 'order_list' %}">▤ <span>Orders</span></a>
+        <span class="nav-item">♧ <span>KOT</span></span>
+        <span class="nav-item">♙ <span>Customers</span></span>
+        <span class="nav-item">▧ <span>Trains</span></span>
+        <span class="nav-item">▣ <span>Vendors</span></span>
+        <a class="nav-item active" href="{% url 'reports' %}">▥ <span>Reports</span></a>
+        <span class="nav-item">⚙ <span>Settings</span></span>
+      </nav>
+      <span class="collapse-menu">‹ <span>Collapse Menu</span></span>
+    </aside>
+
+    <main class="main-content reports-content">
+      <header class="topbar">
+        <div><h1>Reports</h1><p>Business overview and sales reports</p></div>
+      </header>
+
+      <section class="report-period-panel" aria-label="Report period">
+        <form method="get" class="period-form">
+          <label for="period">Period</label>
+          <select id="period" name="period">
+            <option value="today" {% if period == "today" %}selected{% endif %}>Today</option>
+            <option value="yesterday" {% if period == "yesterday" %}selected{% endif %}>Yesterday</option>
+            <option value="week" {% if period == "week" %}selected{% endif %}>This Week</option>
+            <option value="month" {% if period == "month" %}selected{% endif %}>This Month</option>
+            <option value="custom" {% if period == "custom" %}selected{% endif %}>Custom</option>
+          </select>
+          <div class="custom-date-fields" {% if period != "custom" %}hidden{% endif %}>
+            <label for="from-date">From Date</label>
+            <input id="from-date" type="date" name="from_date" value="{{ request.GET.from_date }}">
+            <label for="to-date">To Date</label>
+            <input id="to-date" type="date" name="to_date" value="{{ request.GET.to_date }}">
+          </div>
+          <button type="submit">Apply</button>
+        </form>
+        <p class="period-description">{{ period_label }}{% if start_date and end_date %}: {{ start_date|date:"d M Y" }} – {{ end_date|date:"d M Y" }}{% endif %}</p>
+        {% if validation_error %}<p class="validation-error" role="alert">{{ validation_error }}</p>{% endif %}
+      </section>
+
+      <section class="summary-grid report-summary-grid" aria-label="Report summary">
+        <article class="summary-card"><span class="summary-icon total">▥</span><div><strong>{{ summary.total_orders }}</strong><small>Total Orders</small></div></article>
+        <article class="summary-card"><span class="summary-icon new">₹</span><div><strong>₹{{ summary.cod_value|floatformat:"2g" }}</strong><small>COD Value</small></div></article>
+        <article class="summary-card"><span class="summary-icon ready">₹</span><div><strong>₹{{ summary.online_value|floatformat:"2g" }}</strong><small>Online Value</small></div></article>
+        <article class="summary-card"><span class="summary-icon preparing">₹</span><div><strong>₹{{ summary.net_sales|floatformat:"2g" }}</strong><small>Net Sales</small></div></article>
+      </section>
+
+      <details class="vendor-breakdown">
+        <summary>Vendor Breakdown <span>View vendor sales totals</span></summary>
+        <div class="vendor-table-wrap">
+          <table class="vendor-table">
+            <thead><tr><th>Vendor</th><th>Total Orders</th><th>COD Value</th><th>Online Value</th><th>Net Sales</th></tr></thead>
+            <tbody>
+              {% for vendor in vendor_breakdown %}
+                <tr><td>{{ vendor.vendor__name }}</td><td>{{ vendor.total_orders }}</td><td>₹{{ vendor.cod_value|floatformat:"2g" }}</td><td>₹{{ vendor.online_value|floatformat:"2g" }}</td><td>₹{{ vendor.net_sales|floatformat:"2g" }}</td></tr>
+              {% empty %}
+                <tr><td colspan="5" class="no-report-data">No orders found for this period.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </main>
+  </div>
+  <script src="{% static 'Orders/js/reports.js' %}"></script>
+</body>
+</html>

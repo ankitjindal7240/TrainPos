@@ -1,13 +1,15 @@
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from email.message import EmailMessage
 
+from django.core.management.base import CommandError
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from Orders.models import Customer, IncomingEmail, Order, Train, Vendor
 from Orders.management.commands.poll_gmail_orders import Command
+from Orders.management.commands.backfill_gmail_orders import Command as BackfillCommand
 from Orders.parsers.homebytes import parse_homebytes_email
 from Orders.parsers.railrecipe import parse_railrecipe_email
 from Orders.parsers.railrestro import parse_railrestro_email
@@ -225,6 +227,39 @@ class OrderCreationServiceTests(TestCase):
             "2026-08-20 15:00:00",
         )
 
+    def test_railrecipe_normalizes_payment_status_variants(self):
+        for raw_payment_status, expected_payment_mode in (
+            ("CASH_ON_DELIVERY", Order.PaymentMode.CASH_ON_DELIVERY),
+            ("CASH ON DELIVERY", Order.PaymentMode.CASH_ON_DELIVERY),
+            ("COD", Order.PaymentMode.CASH_ON_DELIVERY),
+            ("PREPAID", Order.PaymentMode.PRE_PAID),
+            ("PRE_PAID", Order.PaymentMode.PRE_PAID),
+        ):
+            body = f"""
+                Order No. RR-100 Mobile No. 9462623238 Train No. 12963
+                Coach/Seat B2 / 36 Order Date Aug 20, 2026
+                Delivery Time (ETA) Kota 15:00 Journey Date
+                PAYMENT STATUS: {raw_payment_status}
+            """
+            self.assertEqual(
+                parse_railrecipe_email(body)["payment_mode"], expected_payment_mode
+            )
+
+    def test_railrestro_paid_total_with_zero_collection_is_prepaid(self):
+        body = """
+            ORDER #: 5726441 Customer: Test Customer M. 9000000000
+            TRAIN: 12963 / MEWAR EXPRESS
+            Delivery Time: 2026-08-20 20:05:00
+            Coact/Seat: B2-36
+            Final Total: Rs. 382.10
+            Paid Total: Rs. 382.10
+            (Amount to collect) Rs. 0/-
+        """
+
+        parsed = parse_railrestro_email(body)
+
+        self.assertEqual(parsed["payment_mode"], Order.PaymentMode.PRE_PAID)
+
     def test_gmail_poll_recovers_offline_email_and_skips_it_on_next_cycle(self):
         class FakeMail:
             def __init__(self, message):
@@ -235,9 +270,10 @@ class OrderCreationServiceTests(TestCase):
                     return "OK", [(b"message", self.message)]
                 raise AssertionError(f"Unexpected IMAP command: {command}")
 
-        body = """
-            Booking Date: 20 Aug 2026, 14:17<br>
-            Delivery Date: 20 Aug 2026, 15:00<br>
+        today = timezone.localdate()
+        body = f"""
+            Booking Date: {today:%d %b %Y}, 14:17<br>
+            Delivery Date: {today:%d %b %Y}, 15:00<br>
             Customer Name : Radha Krishna<br>
             Customer Contact : 9462623238<br>
             Invoice HB-OFFLINE-1 / 2470000000<br>
@@ -250,7 +286,7 @@ class OrderCreationServiceTests(TestCase):
         message = EmailMessage()
         message["From"] = "HomeBytes <info@homebytes.co.in>"
         message["Subject"] = "HomeBytes offline order"
-        message["Date"] = "Thu, 20 Aug 2026 14:17:00 +0000"
+        message["Date"] = today.strftime("%a, %d %b %Y 14:17:00 +0000")
         message.set_content(body, subtype="html")
 
         command = Command()
@@ -291,4 +327,369 @@ class OrderCreationServiceTests(TestCase):
                 "BEFORE",
                 (today + timedelta(days=1)).strftime("%d-%b-%Y"),
             ),
+        )
+
+
+class ReportsViewTests(TestCase):
+    def setUp(self):
+        self.homebytes = Vendor.objects.create(
+            name="HomeBytes", email_address="info@homebytes.co.in"
+        )
+        self.railrestro = Vendor.objects.create(
+            name="RailRestro", email_address="no-reply@railrestro.com"
+        )
+        self.customer = Customer.objects.create(name="Report Customer", phone="9000000000")
+        self.train = Train.objects.create(train_number="12963", train_name="MEWAR EXPRESS")
+
+    def _order(self, number, order_date, total, payment_mode, vendor=None, status=None):
+        return Order.objects.create(
+            vendor=vendor or self.homebytes,
+            order_number=number,
+            customer=self.customer,
+            train=self.train,
+            order_date=timezone.make_aware(datetime.combine(order_date, time(12, 0))),
+            payment_mode=payment_mode,
+            total=Decimal(total),
+            status=status or Order.Status.NEW,
+        )
+
+    def test_today_report_filters_using_order_date(self):
+        today = timezone.localdate()
+        self._order("TODAY", today, "100.00", Order.PaymentMode.PRE_PAID)
+        self._order("YESTERDAY", today - timedelta(days=1), "200.00", Order.PaymentMode.PRE_PAID)
+
+        response = self.client.get(reverse("reports"))
+
+        self.assertContains(response, "Today")
+        self.assertEqual(response.context["summary"]["total_orders"], 1)
+
+    def test_yesterday_report_filters_using_order_date(self):
+        today = timezone.localdate()
+        self._order("TODAY", today, "100.00", Order.PaymentMode.PRE_PAID)
+        self._order("YESTERDAY", today - timedelta(days=1), "200.00", Order.PaymentMode.CASH_ON_DELIVERY)
+
+        response = self.client.get(reverse("reports"), {"period": "yesterday"})
+
+        self.assertEqual(response.context["summary"]["total_orders"], 1)
+        self.assertEqual(response.context["summary"]["cod_value"], Decimal("200.00"))
+
+    def test_this_week_starts_on_monday(self):
+        today = timezone.localdate()
+        monday = today - timedelta(days=today.weekday())
+        self._order("MONDAY", monday, "100.00", Order.PaymentMode.PRE_PAID)
+        self._order("PREVIOUS-SUNDAY", monday - timedelta(days=1), "200.00", Order.PaymentMode.PRE_PAID)
+
+        response = self.client.get(reverse("reports"), {"period": "week"})
+
+        self.assertEqual(response.context["start_date"], monday)
+        self.assertEqual(response.context["summary"]["total_orders"], 1)
+
+    def test_this_month_starts_on_first_day_and_ends_today(self):
+        today = timezone.localdate()
+        first_day = today.replace(day=1)
+        previous_month_day = first_day - timedelta(days=1)
+        self._order("FIRST-DAY", first_day, "100.00", Order.PaymentMode.PRE_PAID)
+        self._order("PREVIOUS-MONTH", previous_month_day, "200.00", Order.PaymentMode.PRE_PAID)
+
+        response = self.client.get(reverse("reports"), {"period": "month"})
+
+        self.assertEqual(response.context["start_date"], first_day)
+        self.assertEqual(response.context["end_date"], today)
+        self.assertEqual(response.context["summary"]["total_orders"], 1)
+
+    def test_custom_range_is_inclusive(self):
+        today = timezone.localdate()
+        start_date = today - timedelta(days=3)
+        end_date = today - timedelta(days=1)
+        self._order("START", start_date, "100.00", Order.PaymentMode.PRE_PAID)
+        self._order("MIDDLE", start_date + timedelta(days=1), "200.00", Order.PaymentMode.PRE_PAID)
+        self._order("END", end_date, "300.00", Order.PaymentMode.PRE_PAID)
+        self._order("OUTSIDE", today, "400.00", Order.PaymentMode.PRE_PAID)
+
+        response = self.client.get(
+            reverse("reports"),
+            {"period": "custom", "from_date": start_date, "to_date": end_date},
+        )
+
+        self.assertEqual(response.context["summary"]["total_orders"], 3)
+        self.assertEqual(response.context["summary"]["online_value"], Decimal("600.00"))
+
+    def test_invalid_custom_range_shows_validation_message(self):
+        today = timezone.localdate()
+
+        response = self.client.get(
+            reverse("reports"),
+            {"period": "custom", "from_date": today, "to_date": today - timedelta(days=1)},
+        )
+
+        self.assertContains(response, "From Date cannot be after To Date.")
+        self.assertEqual(response.context["summary"]["total_orders"], 0)
+
+    def test_report_aggregates_cod_online_and_net_sales(self):
+        today = timezone.localdate()
+        self._order("COD", today, "125.50", Order.PaymentMode.CASH_ON_DELIVERY)
+        self._order("ONLINE", today, "200.25", Order.PaymentMode.PRE_PAID)
+
+        response = self.client.get(reverse("reports"))
+        summary = response.context["summary"]
+
+        self.assertEqual(summary["total_orders"], 2)
+        self.assertEqual(summary["cod_value"], Decimal("125.50"))
+        self.assertEqual(summary["online_value"], Decimal("200.25"))
+        self.assertEqual(summary["net_sales"], Decimal("325.75"))
+
+    def test_vendor_totals_reconcile_with_overall_totals(self):
+        today = timezone.localdate()
+        self._order("HOME-COD", today, "125.00", Order.PaymentMode.CASH_ON_DELIVERY)
+        self._order(
+            "RAIL-ONLINE",
+            today,
+            "200.00",
+            Order.PaymentMode.PRE_PAID,
+            vendor=self.railrestro,
+        )
+
+        response = self.client.get(reverse("reports"))
+        vendor_rows = list(response.context["vendor_breakdown"])
+
+        self.assertEqual(sum(row["total_orders"] for row in vendor_rows), 2)
+        self.assertEqual(
+            sum(row["cod_value"] for row in vendor_rows),
+            response.context["summary"]["cod_value"],
+        )
+        self.assertEqual(
+            sum(row["online_value"] for row in vendor_rows),
+            response.context["summary"]["online_value"],
+        )
+        self.assertEqual(
+            sum(row["net_sales"] for row in vendor_rows),
+            response.context["summary"]["net_sales"],
+        )
+
+    def test_reports_include_all_order_statuses(self):
+        today = timezone.localdate()
+        self._order(
+            "CANCELLED-STATUS",
+            today,
+            "100.00",
+            Order.PaymentMode.CASH_ON_DELIVERY,
+            status=Order.Status.CANCELLED,
+        )
+        self._order(
+            "DELIVERED-STATUS",
+            today,
+            "200.00",
+            Order.PaymentMode.PRE_PAID,
+            status=Order.Status.DELIVERED,
+        )
+
+        response = self.client.get(reverse("reports"))
+
+        self.assertEqual(response.context["summary"]["total_orders"], 2)
+
+
+class GmailBackfillCommandTests(TestCase):
+    def setUp(self):
+        self.vendor = Vendor.objects.create(
+            name="HomeBytes", email_address="info@homebytes.co.in"
+        )
+
+    def _message(self, order_number, order_day, body=None):
+        message = EmailMessage()
+        message["From"] = "HomeBytes <info@homebytes.co.in>"
+        message["Subject"] = f"HomeBytes {order_number}"
+        message["Date"] = order_day.strftime("%a, %d %b %Y 10:00:00 +0000")
+        message.set_content(
+            body
+            or f"""
+                Booking Date: {order_day:%d %b %Y}, 09:30<br>
+                Delivery Date: {order_day:%d %b %Y}, 10:00<br>
+                Customer Name : Backfill Customer<br>
+                Customer Contact : 9000000000<br>
+                Invoice {order_number} / 2470000000<br>
+                Payment: PRE_PAID<br>
+                Coach / Berth: B2 / 36<br>
+                Train: 12963 / MEWAR EXPRESS<br>
+                GST (5%) 15.00 Discount 0.00 Total: 315.00
+                <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
+            """,
+            subtype="html",
+        )
+        return message.as_bytes()
+
+    def _mail(self, messages):
+        class FakeMail:
+            def __init__(self, values):
+                self.messages = values
+                self.search_arguments = None
+
+            def uid(self, command, *arguments):
+                if command == "search":
+                    self.search_arguments = (command, *arguments)
+                    return "OK", [b" ".join(self.messages)]
+                if command == "fetch":
+                    return "OK", [(b"message", self.messages[arguments[0]])]
+                raise AssertionError(f"Unexpected IMAP command: {command}")
+
+        return FakeMail(messages)
+
+    def _stats(self):
+        return {
+            "checked": 0,
+            "vendor_emails": 0,
+            "new": 0,
+            "orders": 0,
+            "skipped": 0,
+            "failures": 0,
+        }
+
+    def test_search_range_is_inclusive_and_before_uses_next_day(self):
+        command = BackfillCommand()
+        mail = self._mail({b"8001": self._message("HB-SEARCH", date(2026, 8, 1))})
+
+        message_uids = command._message_uids_for_range(
+            mail, date(2026, 8, 1), date(2026, 8, 22)
+        )
+
+        self.assertEqual(message_uids, [b"8001"])
+        self.assertEqual(
+            mail.search_arguments,
+            ("search", None, "SINCE", "01-Aug-2026", "BEFORE", "23-Aug-2026"),
+        )
+
+    def test_invalid_date_arguments_are_rejected(self):
+        command = BackfillCommand()
+
+        with self.assertRaises(CommandError):
+            command._date_range(None, None)
+        with self.assertRaises(CommandError):
+            command._date_range("not-a-date", "2026-08-22")
+        with self.assertRaises(CommandError):
+            command._date_range("2026-08-23", "2026-08-22")
+
+    def test_existing_message_id_is_skipped(self):
+        historical_day = date(2026, 8, 5)
+        IncomingEmail.objects.create(
+            message_id="8002",
+            vendor=self.vendor,
+            subject="Existing",
+            body="Existing body",
+            received_at=timezone.now(),
+        )
+        command = BackfillCommand()
+        stats = self._stats()
+
+        command._process_message(
+            self._mail({b"8002": self._message("HB-EXISTING", historical_day)}),
+            b"8002",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_new_historical_email_creates_order_with_historical_order_date(self):
+        historical_day = date(2026, 8, 5)
+        command = BackfillCommand()
+        stats = self._stats()
+        mail = self._mail({b"8003": self._message("HB-HISTORICAL", historical_day)})
+
+        command._process_message(
+            mail, b"8003", stats, historical_day, historical_day, False
+        )
+        order = Order.objects.get(order_number="HB-HISTORICAL")
+
+        self.assertEqual(stats["new"], 1)
+        self.assertEqual(stats["orders"], 1)
+        self.assertEqual(timezone.localtime(order.order_date).date(), historical_day)
+
+        command._process_message(
+            mail, b"8003", stats, historical_day, historical_day, False
+        )
+        self.assertEqual(Order.objects.filter(order_number="HB-HISTORICAL").count(), 1)
+        self.assertEqual(IncomingEmail.objects.filter(message_id="8003").count(), 1)
+        self.assertEqual(stats["skipped"], 1)
+
+    def test_failed_email_does_not_stop_a_later_email(self):
+        historical_day = date(2026, 8, 5)
+        command = BackfillCommand()
+        stats = self._stats()
+        mail = self._mail(
+            {
+                b"8004": self._message("HB-BROKEN", historical_day, "Malformed order"),
+                b"8005": self._message("HB-GOOD", historical_day),
+            }
+        )
+
+        command._process_message(
+            mail, b"8004", stats, historical_day, historical_day, False
+        )
+        command._process_message(
+            mail, b"8005", stats, historical_day, historical_day, False
+        )
+
+        self.assertEqual(stats["failures"], 1)
+        self.assertEqual(stats["orders"], 1)
+        self.assertEqual(
+            IncomingEmail.objects.get(message_id="8004").processing_status,
+            IncomingEmail.ProcessingStatus.FAILED,
+        )
+        self.assertTrue(Order.objects.filter(order_number="HB-GOOD").exists())
+
+    def test_dry_run_does_not_write_data(self):
+        historical_day = date(2026, 8, 5)
+        command = BackfillCommand()
+        stats = self._stats()
+
+        command._process_message(
+            self._mail({b"8006": self._message("HB-DRY-RUN", historical_day)}),
+            b"8006",
+            stats,
+            historical_day,
+            historical_day,
+            True,
+        )
+
+        self.assertEqual(stats["new"], 1)
+        self.assertEqual(stats["orders"], 0)
+        self.assertEqual(IncomingEmail.objects.count(), 0)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_retry_selected_failed_message_uses_saved_body_without_duplicates(self):
+        historical_day = date(2026, 8, 5)
+        body = f"""
+            Booking Date: {historical_day:%d %b %Y}, 09:30<br>
+            Delivery Date: {historical_day:%d %b %Y}, 10:00<br>
+            Customer Name : Retry Customer<br>
+            Customer Contact : 9000000000<br>
+            Invoice HB-RETRY / 2470000000<br>
+            Payment: PRE_PAID<br>
+            Coach / Berth: B2 / 36<br>
+            Train: 12963 / MEWAR EXPRESS
+            <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
+        """
+        IncomingEmail.objects.create(
+            message_id="8010",
+            vendor=self.vendor,
+            subject="Failed historical order",
+            body=body,
+            received_at=timezone.now(),
+            processing_status=IncomingEmail.ProcessingStatus.FAILED,
+            error_message="A valid payment mode is required to create an order.",
+        )
+        command = BackfillCommand()
+
+        stats = command._retry_failed_messages(["8010"], False)
+        repeat_stats = command._retry_failed_messages(["8010"], False)
+
+        self.assertEqual(stats["orders"], 1)
+        self.assertEqual(repeat_stats["orders"], 0)
+        self.assertEqual(repeat_stats["skipped"], 1)
+        self.assertEqual(Order.objects.filter(order_number="HB-RETRY").count(), 1)
+        self.assertEqual(
+            IncomingEmail.objects.get(message_id="8010").processing_status,
+            IncomingEmail.ProcessingStatus.PROCESSED,
         )

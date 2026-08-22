@@ -1,7 +1,13 @@
 import re
+import logging
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
+
+from Orders.services.payment_modes import normalize_payment_mode
+
+
+logger = logging.getLogger(__name__)
 
 
 class _RailRecipeHtmlParser(HTMLParser):
@@ -117,15 +123,22 @@ def parse_railrecipe_email(body):
     parser.close()
     text = " ".join("".join(parser.text_parts).split())
 
-    payment_status = _find(r"PAYMENT STATUS\s*(PREPAID|COD)", text)
+    payment_status = _find(
+        r"PAYMENT\s+STATUS\s*:?\s*(CASH(?:[_\s]+ON[_\s]+DELIVERY)?|COD|PRE[_\s-]*PAID)",
+        text,
+    )
     total = _find_amount("Grand Total", text)
+    payment_mode = normalize_payment_mode(payment_status)
+    logger.debug(
+        "RailRecipe payment normalization raw=%r normalized=%r",
+        payment_status,
+        payment_mode,
+    )
 
-    if payment_status == "PREPAID":
-        payment_mode = "PRE_PAID"
+    if payment_mode == "PRE_PAID":
         advance = total
         amount_to_collect = Decimal("0")
-    elif payment_status == "COD":
-        payment_mode = "CASH_ON_DELIVERY"
+    elif payment_mode == "CASH_ON_DELIVERY":
         advance = Decimal("0")
         amount_to_collect = total
     else:

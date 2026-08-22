@@ -1,7 +1,11 @@
 import re
+import logging
 from decimal import Decimal, InvalidOperation
 from html import unescape
 from html.parser import HTMLParser
+
+
+logger = logging.getLogger(__name__)
 
 
 class _EmailHtmlParser(HTMLParser):
@@ -88,17 +92,32 @@ def parse_railrestro_email(body):
     train_number = _find(r"TRAIN:\s*([A-Za-z0-9]+)\s*/", text)
     coach = _find(r"Coact/Seat:\s*([A-Za-z0-9]+)\s*-", text)
     berth = _find(r"Coact/Seat:\s*[A-Za-z0-9]+\s*-\s*([A-Za-z0-9]+)", text)
-    advance = _find_amount("Prepaid", text)
-    amount_to_collect = _amount(
-        _find(r"\(Amount to collect\)\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    prepaid_raw = _find(r"Prepaid\s*:?\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    advance = _amount(prepaid_raw)
+    amount_to_collect_raw = _find(
+        r"\(Amount to collect\)\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text
     )
+    amount_to_collect = _amount(amount_to_collect_raw)
+    paid_total_raw = _find(r"Paid Total\s*:?\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    paid_total = _amount(paid_total_raw)
 
     if advance is not None and advance > 0:
         payment_mode = "PRE_PAID"
     elif amount_to_collect is not None and amount_to_collect > 0:
         payment_mode = "CASH_ON_DELIVERY"
+    elif paid_total is not None and paid_total > 0 and amount_to_collect == Decimal("0"):
+        payment_mode = "PRE_PAID"
     else:
         payment_mode = None
+    logger.debug(
+        "RailRestro payment normalization raw=%r normalized=%r",
+        {
+            "prepaid": prepaid_raw,
+            "paid_total": paid_total_raw,
+            "amount_to_collect": amount_to_collect_raw,
+        },
+        payment_mode,
+    )
 
     return {
         "order_number": _find(r"ORDER\s*#:\s*([A-Za-z0-9-]+)", text),
