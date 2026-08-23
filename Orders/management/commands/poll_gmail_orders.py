@@ -14,6 +14,7 @@ from Orders.parsers.railrecipe import parse_railrecipe_email
 from Orders.parsers.railrestro import parse_railrestro_email
 from Orders.parsers.rajbhog_khana import parse_rajbhog_khana_email
 from Orders.services.gmail_email import decode_subject, extract_body, get_received_at
+from Orders.services.email_classification import ORDER, classify_vendor_email
 from Orders.services.order_creation import create_order_from_incoming_email
 
 
@@ -60,7 +61,14 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("[TrainPOS] Gmail polling stopped."))
 
     def _poll_once(self, email_address, app_password):
-        stats = {"checked": 0, "new": 0, "orders": 0, "skipped": 0, "failures": 0}
+        stats = {
+            "checked": 0,
+            "new": 0,
+            "existing_retried": 0,
+            "orders": 0,
+            "skipped": 0,
+            "failures": 0,
+        }
         mail = None
         today = timezone.localdate()
         self.stdout.write(f"[TrainPOS] Checking today's Gmail orders ({today.isoformat()})...")
@@ -88,7 +96,8 @@ class Command(BaseCommand):
         self.stdout.write(
             "[TrainPOS] Cycle complete: "
             f"checked={stats['checked']} new={stats['new']} "
-            f"orders={stats['orders']} skipped={stats['skipped']} "
+            f"orders={stats['orders']} retried={stats['existing_retried']} "
+            f"skipped={stats['skipped']} "
             f"failures={stats['failures']}"
         )
         return stats
@@ -128,10 +137,31 @@ class Command(BaseCommand):
         vendor = Vendor.objects.filter(email_address__iexact=sender_email).first()
         if vendor is None:
             return
+        subject = decode_subject(header_message.get("Subject"))
 
-        if IncomingEmail.objects.filter(message_id=message_id).exists():
-            stats["skipped"] += 1
-            self.stdout.write(f"[SKIP] Already ingested - {message_id}")
+        incoming_email = (
+            IncomingEmail.objects.filter(message_id=message_id)
+            .select_related("vendor")
+            .first()
+        )
+        if classify_vendor_email(vendor, subject) != ORDER:
+            self._store_non_order_email(
+                mail, message_uid, message_id, vendor, subject, incoming_email, stats
+            )
+            return
+        if incoming_email is not None:
+            if incoming_email.order_id:
+                stats["skipped"] += 1
+                self.stdout.write(f"[SKIP] Already successfully ingested - {message_id}")
+                return
+            stats["existing_retried"] += 1
+            if classify_vendor_email(
+                incoming_email.vendor, incoming_email.subject, incoming_email.body
+            ) != ORDER:
+                self._mark_non_order(incoming_email, stats)
+                return
+            self.stdout.write(f"[RETRY] {incoming_email.vendor.name} - message {message_id}")
+            self._create_order_from_incoming_email(incoming_email, stats)
             return
 
         status, message_data = mail.uid("fetch", message_uid, "(RFC822)")
@@ -154,15 +184,70 @@ class Command(BaseCommand):
             },
         )
         if not created:
-            stats["skipped"] += 1
-            self.stdout.write(f"[SKIP] Already ingested - {message_id}")
+            if incoming_email.order_id:
+                stats["skipped"] += 1
+                self.stdout.write(f"[SKIP] Already successfully ingested - {message_id}")
+                return
+            stats["existing_retried"] += 1
+            if classify_vendor_email(
+                incoming_email.vendor, incoming_email.subject, incoming_email.body
+            ) != ORDER:
+                self._mark_non_order(incoming_email, stats)
+                return
+            self.stdout.write(f"[RETRY] {incoming_email.vendor.name} - message {message_id}")
+            self._create_order_from_incoming_email(incoming_email, stats)
             return
 
         stats["new"] += 1
         self.stdout.write(f"[NEW] {vendor.name} - message {message_id}")
+        if classify_vendor_email(vendor, incoming_email.subject, incoming_email.body) != ORDER:
+            self._mark_non_order(incoming_email, stats)
+            return
+        self._create_order_from_incoming_email(incoming_email, stats)
 
+    def _store_non_order_email(
+        self, mail, message_uid, message_id, vendor, subject, incoming_email, stats
+    ):
+        if incoming_email is None:
+            status, message_data = mail.uid("fetch", message_uid, "(RFC822)")
+            if status != "OK" or not message_data or not message_data[0]:
+                stats["failures"] += 1
+                self.stderr.write(
+                    self.style.ERROR(f"[ERROR] Could not fetch message {message_id}")
+                )
+                return
+            message = email.message_from_bytes(message_data[0][1])
+            incoming_email, _ = IncomingEmail.objects.get_or_create(
+                message_id=message_id,
+                defaults={
+                    "vendor": vendor,
+                    "subject": subject[:500],
+                    "body": extract_body(message),
+                    "received_at": get_received_at(message),
+                    "processing_status": IncomingEmail.ProcessingStatus.SKIPPED,
+                    "error_message": "",
+                    "order": None,
+                },
+            )
+        self._mark_non_order(incoming_email, stats)
+
+    def _mark_non_order(self, incoming_email, stats):
+        if incoming_email.order_id:
+            stats["skipped"] += 1
+            self.stdout.write(
+                f"[SKIP] Already successfully ingested - {incoming_email.message_id}"
+            )
+            return
+        IncomingEmail.objects.filter(pk=incoming_email.pk).update(
+            processing_status=IncomingEmail.ProcessingStatus.SKIPPED,
+            error_message="",
+        )
+        stats["skipped"] += 1
+        self.stdout.write(f"[SKIP] Non-order status update - {incoming_email.message_id}")
+
+    def _create_order_from_incoming_email(self, incoming_email, stats):
         try:
-            parser = PARSERS[vendor.name]
+            parser = PARSERS[incoming_email.vendor.name]
             order = create_order_from_incoming_email(incoming_email, parser(incoming_email.body))
         except Exception as error:
             IncomingEmail.objects.filter(pk=incoming_email.pk, order__isnull=True).update(
@@ -170,8 +255,13 @@ class Command(BaseCommand):
                 error_message=str(error),
             )
             stats["failures"] += 1
-            self.stderr.write(self.style.ERROR(f"[ERROR] {vendor.name} - {message_id}: {error}"))
-            return
+            self.stderr.write(
+                self.style.ERROR(
+                    f"[ERROR] {incoming_email.vendor.name} - {incoming_email.message_id}: {error}"
+                )
+            )
+            return None
 
         stats["orders"] += 1
         self.stdout.write(f"[ORDER CREATED] {order.order_number}")
+        return order

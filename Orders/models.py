@@ -88,6 +88,7 @@ class IncomingEmail(models.Model):
         RECEIVED = "RECEIVED", "Received"
         PROCESSED = "PROCESSED", "Processed"
         FAILED = "FAILED", "Failed"
+        SKIPPED = "SKIPPED", "Skipped (non-order email)"
 
     message_id = models.CharField(max_length=255, unique=True)
     vendor = models.ForeignKey(

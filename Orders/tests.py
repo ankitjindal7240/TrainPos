@@ -302,6 +302,59 @@ class OrderCreationServiceTests(TestCase):
         self.assertEqual(IncomingEmail.objects.filter(message_id="9001").count(), 1)
         self.assertEqual(Order.objects.filter(order_number="HB-OFFLINE-1").count(), 1)
 
+    def test_gmail_poll_retries_existing_received_email_without_an_order(self):
+        class FakeMail:
+            def __init__(self, message):
+                self.message = message
+
+            def uid(self, command, message_uid, query):
+                if command == "fetch":
+                    return "OK", [(b"message", self.message)]
+                raise AssertionError(f"Unexpected IMAP command: {command}")
+
+        today = timezone.localdate()
+        body = f"""
+            Booking Date: {today:%d %b %Y}, 14:17<br>
+            Delivery Date: {today:%d %b %Y}, 15:00<br>
+            Customer Name : Radha Krishna<br>
+            Customer Contact : 9462623238<br>
+            Invoice HB-LIVE-RETRY / 2470000000<br>
+            Payment: PRE_PAID<br>
+            Coach / Berth: B2 / 36<br>
+            Train: 12963 / MEWAR EXPRESS<br>
+            GST (5%) 15.00 Discount 0.00 Total: 315.00
+            <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
+        """
+        IncomingEmail.objects.create(
+            message_id="9002",
+            vendor=self.vendors["HomeBytes"],
+            subject="Existing received order",
+            body=body,
+            received_at=timezone.now(),
+            processing_status=IncomingEmail.ProcessingStatus.RECEIVED,
+        )
+        message = EmailMessage()
+        message["From"] = "HomeBytes <info@homebytes.co.in>"
+        message["Subject"] = "HomeBytes retry"
+        message["Date"] = today.strftime("%a, %d %b %Y 14:17:00 +0000")
+        message.set_content(body, subtype="html")
+        stats = {
+            "checked": 1,
+            "new": 0,
+            "existing_retried": 0,
+            "orders": 0,
+            "skipped": 0,
+            "failures": 0,
+        }
+
+        Command()._process_message(FakeMail(message.as_bytes()), b"9002", stats)
+
+        incoming_email = IncomingEmail.objects.get(message_id="9002")
+        self.assertEqual(stats["existing_retried"], 1)
+        self.assertEqual(stats["orders"], 1)
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.PROCESSED)
+        self.assertTrue(Order.objects.filter(order_number="HB-LIVE-RETRY").exists())
+
     def test_gmail_poll_searches_only_the_current_local_date(self):
         class FakeMail:
             def __init__(self):
@@ -494,6 +547,20 @@ class GmailBackfillCommandTests(TestCase):
             name="HomeBytes", email_address="info@homebytes.co.in"
         )
 
+    def _body(self, order_number, order_day):
+        return f"""
+            Booking Date: {order_day:%d %b %Y}, 09:30<br>
+            Delivery Date: {order_day:%d %b %Y}, 10:00<br>
+            Customer Name : Backfill Customer<br>
+            Customer Contact : 9000000000<br>
+            Invoice {order_number} / 2470000000<br>
+            Payment: PRE_PAID<br>
+            Coach / Berth: B2 / 36<br>
+            Train: 12963 / MEWAR EXPRESS<br>
+            GST (5%) 15.00 Discount 0.00 Total: 315.00
+            <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
+        """
+
     def _message(self, order_number, order_day, body=None):
         message = EmailMessage()
         message["From"] = "HomeBytes <info@homebytes.co.in>"
@@ -501,18 +568,7 @@ class GmailBackfillCommandTests(TestCase):
         message["Date"] = order_day.strftime("%a, %d %b %Y 10:00:00 +0000")
         message.set_content(
             body
-            or f"""
-                Booking Date: {order_day:%d %b %Y}, 09:30<br>
-                Delivery Date: {order_day:%d %b %Y}, 10:00<br>
-                Customer Name : Backfill Customer<br>
-                Customer Contact : 9000000000<br>
-                Invoice {order_number} / 2470000000<br>
-                Payment: PRE_PAID<br>
-                Coach / Berth: B2 / 36<br>
-                Train: 12963 / MEWAR EXPRESS<br>
-                GST (5%) 15.00 Discount 0.00 Total: 315.00
-                <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
-            """,
+            or self._body(order_number, order_day),
             subtype="html",
         )
         return message.as_bytes()
@@ -538,6 +594,7 @@ class GmailBackfillCommandTests(TestCase):
             "checked": 0,
             "vendor_emails": 0,
             "new": 0,
+            "existing_retried": 0,
             "orders": 0,
             "skipped": 0,
             "failures": 0,
@@ -567,20 +624,21 @@ class GmailBackfillCommandTests(TestCase):
         with self.assertRaises(CommandError):
             command._date_range("2026-08-23", "2026-08-22")
 
-    def test_existing_message_id_is_skipped(self):
+    def test_existing_received_email_without_order_is_retried(self):
         historical_day = date(2026, 8, 5)
         IncomingEmail.objects.create(
             message_id="8002",
             vendor=self.vendor,
             subject="Existing",
-            body="Existing body",
+            body=self._body("HB-RECEIVED", historical_day),
             received_at=timezone.now(),
+            processing_status=IncomingEmail.ProcessingStatus.RECEIVED,
         )
         command = BackfillCommand()
         stats = self._stats()
 
         command._process_message(
-            self._mail({b"8002": self._message("HB-EXISTING", historical_day)}),
+            self._mail({b"8002": self._message("HB-RECEIVED", historical_day)}),
             b"8002",
             stats,
             historical_day,
@@ -588,8 +646,74 @@ class GmailBackfillCommandTests(TestCase):
             False,
         )
 
+        incoming_email = IncomingEmail.objects.get(message_id="8002")
+        self.assertEqual(stats["existing_retried"], 1)
+        self.assertEqual(stats["orders"], 1)
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.PROCESSED)
+        self.assertIsNotNone(incoming_email.order_id)
+
+        command._process_message(
+            self._mail({b"8002": self._message("HB-RECEIVED", historical_day)}),
+            b"8002",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+        self.assertEqual(Order.objects.filter(order_number="HB-RECEIVED").count(), 1)
         self.assertEqual(stats["skipped"], 1)
-        self.assertEqual(Order.objects.count(), 0)
+
+    def test_existing_failed_email_without_order_is_retried(self):
+        historical_day = date(2026, 8, 5)
+        IncomingEmail.objects.create(
+            message_id="8007",
+            vendor=self.vendor,
+            subject="Failed",
+            body=self._body("HB-FAILED", historical_day),
+            received_at=timezone.now(),
+            processing_status=IncomingEmail.ProcessingStatus.FAILED,
+            error_message="Earlier parser error",
+        )
+        stats = self._stats()
+
+        BackfillCommand()._process_message(
+            self._mail({b"8007": self._message("HB-FAILED", historical_day)}),
+            b"8007",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+
+        incoming_email = IncomingEmail.objects.get(message_id="8007")
+        self.assertEqual(stats["existing_retried"], 1)
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.PROCESSED)
+        self.assertEqual(incoming_email.error_message, "")
+
+    def test_existing_processed_email_with_order_is_skipped(self):
+        historical_day = date(2026, 8, 5)
+        body = self._body("HB-PROCESSED", historical_day)
+        incoming_email = IncomingEmail.objects.create(
+            message_id="8008",
+            vendor=self.vendor,
+            subject="Processed",
+            body=body,
+            received_at=timezone.now(),
+        )
+        create_order_from_incoming_email(incoming_email, parse_homebytes_email(body))
+        stats = self._stats()
+
+        BackfillCommand()._process_message(
+            self._mail({b"8008": self._message("HB-PROCESSED", historical_day)}),
+            b"8008",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(Order.objects.filter(order_number="HB-PROCESSED").count(), 1)
 
     def test_new_historical_email_creates_order_with_historical_order_date(self):
         historical_day = date(2026, 8, 5)
@@ -693,3 +817,138 @@ class GmailBackfillCommandTests(TestCase):
             IncomingEmail.objects.get(message_id="8010").processing_status,
             IncomingEmail.ProcessingStatus.PROCESSED,
         )
+
+
+class EmailClassificationCommandTests(TestCase):
+    def setUp(self):
+        self.vendor = Vendor.objects.create(
+            name="RailRestro", email_address="no-reply@railrestro.com"
+        )
+
+    def _mail(self, message):
+        class FakeMail:
+            def uid(self, command, message_uid, query):
+                if command == "fetch":
+                    return "OK", [(b"message", message)]
+                raise AssertionError(f"Unexpected IMAP command: {command}")
+
+        return FakeMail()
+
+    def _message(self, subject, message_day, body):
+        message = EmailMessage()
+        message["From"] = "RailRestro <no-reply@railrestro.com>"
+        message["Subject"] = subject
+        message["Date"] = message_day.strftime("%a, %d %b %Y 10:00:00 +0000")
+        message.set_content(body, subtype="html")
+        return message.as_bytes()
+
+    def _backfill_stats(self):
+        return {
+            "checked": 1,
+            "vendor_emails": 0,
+            "new": 0,
+            "existing_retried": 0,
+            "orders": 0,
+            "skipped": 0,
+            "failures": 0,
+        }
+
+    def _live_stats(self):
+        return {
+            "checked": 1,
+            "new": 0,
+            "existing_retried": 0,
+            "orders": 0,
+            "skipped": 0,
+            "failures": 0,
+        }
+
+    def test_backfill_skips_railrestro_status_update_without_creating_an_order(self):
+        historical_day = date(2026, 8, 8)
+        message = self._message(
+            "Order Status Update for Order #5710417",
+            historical_day,
+            "Current Status: CANCELED",
+        )
+        stats = self._backfill_stats()
+
+        BackfillCommand()._process_message(
+            self._mail(message),
+            b"9101",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+
+        incoming_email = IncomingEmail.objects.get(message_id="9101")
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.SKIPPED)
+        self.assertEqual(incoming_email.error_message, "")
+        self.assertIsNone(incoming_email.order_id)
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertEqual(stats["failures"], 0)
+
+    def test_railrestro_new_order_subject_still_creates_an_order(self):
+        historical_day = date(2026, 8, 8)
+        body = """
+            ORDER #: 5760540 Customer: Test Customer M. 9000000000
+            TRAIN: 12963 / MEWAR EXPRESS
+            Delivery Time: 2026-08-08 20:05:00
+            Coact/Seat: B2-36
+            Prepaid: Rs. 100
+            Final Total: Rs. 100
+            <table><tr><td>Test Meal</td><td>Rs. 100</td><td>1</td><td>Rs. 100</td></tr></table>
+        """
+        stats = self._backfill_stats()
+
+        BackfillCommand()._process_message(
+            self._mail(self._message("New Order #5760540 Received", historical_day, body)),
+            b"9102",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+
+        self.assertEqual(stats["orders"], 1)
+        self.assertTrue(Order.objects.filter(order_number="5760540").exists())
+
+    def test_live_poll_skips_railrestro_status_update_without_creating_an_order(self):
+        today = timezone.localdate()
+        message = self._message(
+            "Order Status Update for Order #5710417",
+            today,
+            "Current Status: CANCELED",
+        )
+        stats = self._live_stats()
+
+        Command()._process_message(self._mail(message), b"9103", stats)
+
+        incoming_email = IncomingEmail.objects.get(message_id="9103")
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.SKIPPED)
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertEqual(stats["failures"], 0)
+
+    def test_railrestro_cancelled_body_is_classified_as_a_non_order(self):
+        historical_day = date(2026, 8, 8)
+        message = self._message(
+            "Order Status Update for Order #5710417",
+            historical_day,
+            "Current Status: CANCELLED",
+        )
+        stats = self._backfill_stats()
+
+        BackfillCommand()._process_message(
+            self._mail(message),
+            b"9104",
+            stats,
+            historical_day,
+            historical_day,
+            False,
+        )
+
+        self.assertEqual(
+            IncomingEmail.objects.get(message_id="9104").processing_status,
+            IncomingEmail.ProcessingStatus.SKIPPED,
+        )
+        self.assertEqual(Order.objects.count(), 0)
