@@ -98,8 +98,11 @@ def parse_railrestro_email(body):
         r"\(Amount to collect\)\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text
     )
     amount_to_collect = _amount(amount_to_collect_raw)
-    paid_total_raw = _find(r"Paid Total\s*:?\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    paid_total_raw = _find(r"Paid\s*Total\s*:?\s*(?:Rs\.?)?\s*([0-9]+(?:\.[0-9]+)?)", text)
     paid_total = _amount(paid_total_raw)
+    final_total = _find_amount("Final Total", text)
+    payable_total = _find_amount("Payable Total", text)
+    subtotal = _find_amount("Subtotal", text)
 
     if advance is not None and advance > 0:
         payment_mode = "PRE_PAID"
@@ -119,6 +122,15 @@ def parse_railrestro_email(body):
         payment_mode,
     )
 
+    if payment_mode == "PRE_PAID":
+        # RailRestro's prepaid confirmation can use Paid Total / Prepaid rather
+        # than the COD-oriented Final Total / Payable Total labels.
+        total = paid_total or advance or final_total or payable_total or subtotal
+    else:
+        # Preserve COD behavior: its collection amount is a valid final sale
+        # value only after the explicit final/payable totals have been checked.
+        total = final_total or payable_total or amount_to_collect or paid_total or subtotal
+
     return {
         "order_number": _find(r"ORDER\s*#:\s*([A-Za-z0-9-]+)", text),
         "customer_name": _find(r"Customer:\s*(.*?)\s+M\.\s*", text),
@@ -127,12 +139,14 @@ def parse_railrestro_email(body):
         "coach": coach,
         "berth": berth,
         "order_date": f"{delivery_date} {delivery_time}" if delivery_date and delivery_time else None,
+        "train_journey_date": None,
         "payment_mode": payment_mode,
         "advance": advance,
+        "subtotal": subtotal,
         "gst": _find_amount("GST", text),
         "tax": _find_amount("Tax", text),
         "discount": _find_amount("Discount", text),
-        "total": _find_amount("Final Total", text) or _find_amount("Payable Total", text),
+        "total": total,
         "amount_to_collect": amount_to_collect,
         "remarks": _find(r"Remarks?\s*:\s*(.*?)(?=\s+(?:Best Regards|$))", text),
         "order_items": _extract_items(parser.rows),

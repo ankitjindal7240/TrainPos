@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -25,6 +25,21 @@ def _parse_order_datetime(order_date):
         return timezone.make_aware(datetime.fromisoformat(str(order_date)))
     except ValueError as error:
         raise ValueError(f"Unsupported order date/time: {order_date}") from error
+
+
+def _parse_train_journey_date(train_journey_date):
+    if not train_journey_date:
+        return None
+    if isinstance(train_journey_date, datetime):
+        return train_journey_date.date()
+    if isinstance(train_journey_date, date):
+        return train_journey_date
+    try:
+        return date.fromisoformat(str(train_journey_date))
+    except ValueError as error:
+        raise ValueError(
+            f"Unsupported train journey date: {train_journey_date}"
+        ) from error
 
 
 def _get_customer(data):
@@ -123,6 +138,9 @@ def create_order_from_incoming_email(incoming_email, data):
                 berth=(data.get("berth") or "").strip(),
                 delivery_station=(data.get("delivery_station") or "").strip(),
                 order_date=_parse_order_datetime(data.get("order_date")),
+                train_journey_date=_parse_train_journey_date(
+                    data.get("train_journey_date")
+                ),
                 payment_mode=payment_mode,
                 subtotal=_to_decimal(data.get("subtotal")),
                 gst=_to_decimal(data.get("gst")),

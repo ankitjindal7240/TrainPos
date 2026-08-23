@@ -148,6 +148,7 @@ def parse_railrecipe_email(body):
 
     order_date = _find(r"Order Date\s*([A-Za-z]{3}\s+\d{1,2},\s*\d{4})", text)
     order_time = _find(r"Delivery Time\s*\(ETA\).*?\s+(\d{1,2}:\d{2})\s+Journey Date", text)
+    journey_date = _find(r"Journey Date\s*(\d{4}-\d{2}-\d{2})", text)
 
     return {
         "order_number": _find(r"Order No\.\s*([A-Za-z0-9-]+)", text),
@@ -157,6 +158,7 @@ def parse_railrecipe_email(body):
         "coach": _find(r"Coach/Seat\s*([A-Za-z0-9]+)\s*/", text),
         "berth": _find(r"Coach/Seat\s*[A-Za-z0-9]+\s*/\s*([A-Za-z0-9]+)", text),
         "order_date": _normalized_order_datetime(order_date, order_time),
+        "train_journey_date": journey_date,
         "payment_mode": payment_mode,
         "advance": advance,
         "gst": _find_amount("GST", text),

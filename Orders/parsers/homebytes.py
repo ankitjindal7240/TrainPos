@@ -109,6 +109,7 @@ def parse_homebytes_email(body):
         "coach": _find(r"Coach\s*/\s*Berth:\s*(.*?)\s+/\s+", text),
         "berth": _find(r"Coach\s*/\s*Berth:\s*.*?\s*/\s*([A-Za-z0-9]+)\s+Train:", text),
         "order_date": _normalized_order_datetime(delivery_date, delivery_time),
+        "train_journey_date": None,
         "payment_mode": payment_mode,
         "advance": advance,
         "gst": _find_amount("GST (5%)", text),

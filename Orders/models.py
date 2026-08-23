@@ -50,6 +50,7 @@ class Order(models.Model):
     berth = models.CharField(max_length=20, blank=True)
     delivery_station = models.CharField(max_length=255, blank=True)
     order_date = models.DateTimeField(null=True, blank=True)
+    train_journey_date = models.DateField(null=True, blank=True)
     payment_mode = models.CharField(max_length=20, choices=PaymentMode.choices)
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     gst = models.DecimalField(max_digits=10, decimal_places=2, default=0)

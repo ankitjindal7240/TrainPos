@@ -1,9 +1,18 @@
-from decimal import Decimal
 from datetime import date, datetime, time, timedelta
 from email.message import EmailMessage
+from decimal import Decimal
+from io import BytesIO, StringIO
+import json
+import os
+import socket
+from types import SimpleNamespace
+from urllib.error import HTTPError
+from unittest.mock import patch
 
+from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase
+from django.core.cache import cache
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -15,6 +24,392 @@ from Orders.parsers.railrecipe import parse_railrecipe_email
 from Orders.parsers.railrestro import parse_railrestro_email
 from Orders.parsers.rajbhog_khana import parse_rajbhog_khana_email
 from Orders.services.order_creation import create_order_from_incoming_email
+from Orders.services.train_status import (
+    TrainStatusError,
+    get_dashboard_status,
+    get_live_status_for_order,
+    get_train_status,
+    refresh_live_status_for_order,
+)
+
+
+class RailRadarResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class TrainStatusServiceTests(SimpleTestCase):
+    journey_date = date(2026, 8, 23)
+
+    def _payload(self, **target_overrides):
+        target = {
+            "stationCode": "GGC",
+            "stationName": "Gangapur City Junction",
+            "scheduledArrival": "2026-08-23T19:15:00+05:30",
+            "expectedArrival": "2026-08-23T19:42:00+05:30",
+            "delayArrival": 27,
+            "status": "upcoming",
+        }
+        target.update(target_overrides)
+        return {
+            "success": True,
+            "data": {
+                "trainNumber": "12963",
+                "status": "running",
+                "delayMinutes": 27,
+                "currentLocation": {"stationCode": "SWM"},
+                "nextHalt": {"stationCode": "GGC", "stationName": "Gangapur City Junction"},
+                "route": [target],
+            },
+        }
+
+    def _get_status(self, mocked_urlopen):
+        return get_train_status("12963", self.journey_date, "GGC")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_successfully_normalizes_target_station_response(self, mocked_urlopen):
+        mocked_urlopen.return_value = RailRadarResponse(self._payload())
+
+        status = self._get_status(mocked_urlopen)
+
+        self.assertEqual(status["train_number"], "12963")
+        self.assertEqual(status["target_station"], "GGC")
+        self.assertEqual(status["journey_date"], "2026-08-23")
+        self.assertEqual(status["scheduled_arrival"], "2026-08-23T19:15:00+05:30")
+        self.assertEqual(status["expected_arrival"], "2026-08-23T19:42:00+05:30")
+        self.assertEqual(status["delay_minutes"], 27)
+        self.assertEqual(status["current_location"], "SWM")
+        self.assertEqual(status["next_station"], "Gangapur City Junction")
+        self.assertEqual(status["provider"], "RailRadar")
+        self.assertTrue(status["raw_available"])
+        request = mocked_urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        self.assertIn("date=2026-08-23", request.full_url)
+        self.assertIn("haltsOnly=true", request.full_url)
+        self.assertEqual(mocked_urlopen.call_args.kwargs["timeout"], 10)
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_missing_eta_is_returned_as_none(self, mocked_urlopen):
+        mocked_urlopen.return_value = RailRadarResponse(
+            self._payload(expectedArrival=None, actualArrival=None)
+        )
+
+        status = self._get_status(mocked_urlopen)
+
+        self.assertIsNone(status["expected_arrival"])
+        self.assertEqual(status["scheduled_arrival"], "2026-08-23T19:15:00+05:30")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_401_is_reported_as_invalid_api_key(self, mocked_urlopen):
+        mocked_urlopen.side_effect = _http_error(401)
+
+        self._assert_error("INVALID_API_KEY")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_404_is_reported_as_train_not_available(self, mocked_urlopen):
+        mocked_urlopen.side_effect = _http_error(404)
+
+        self._assert_error("TRAIN_NOT_AVAILABLE")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_429_is_reported_as_rate_limited(self, mocked_urlopen):
+        mocked_urlopen.side_effect = _http_error(429)
+
+        self._assert_error("RATE_LIMITED")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_503_is_reported_as_unavailable(self, mocked_urlopen):
+        mocked_urlopen.side_effect = _http_error(503)
+
+        self._assert_error("UNAVAILABLE")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_timeout_is_reported_without_leaking_transport_details(self, mocked_urlopen):
+        mocked_urlopen.side_effect = socket.timeout()
+
+        self._assert_error("TIMEOUT")
+
+    @patch.dict(os.environ, {"RAILRADAR_API_KEY": "test-key"}, clear=False)
+    @patch("Orders.services.train_status.urlopen")
+    def test_malformed_response_is_controlled(self, mocked_urlopen):
+        mocked_urlopen.return_value = RailRadarResponse({"success": True, "data": {}})
+
+        self._assert_error("MALFORMED_RESPONSE")
+
+    def _assert_error(self, expected_code):
+        with self.assertRaises(TrainStatusError) as context:
+            get_train_status("12963", self.journey_date, "GGC")
+        self.assertEqual(context.exception.code, expected_code)
+
+
+class TrainRunResolutionTests(SimpleTestCase):
+    operational_date = date(2026, 8, 23)
+
+    def setUp(self):
+        cache.clear()
+
+    def _order(self, train_number="19037", journey_date=None):
+        return SimpleNamespace(
+            order_date=timezone.make_aware(datetime(2026, 8, 23, 12, 0)),
+            train_journey_date=journey_date,
+            train=SimpleNamespace(train_number=train_number),
+        )
+
+    def _status(self, journey_date, **overrides):
+        status = {
+            "train_number": "19037",
+            "target_station": "GGC",
+            "scheduled_arrival": f"{journey_date.isoformat()}T15:00:00+05:30",
+            "expected_arrival": f"{journey_date.isoformat()}T15:34:00+05:30",
+            "delay_minutes": 34,
+            "current_location": "SWM",
+            "next_station": "GGC",
+            "status": "running",
+            "target_status": "upcoming",
+            "provider": "RailRadar",
+            "available": True,
+            "raw_available": True,
+        }
+        status.update(overrides)
+        return status
+
+    def test_same_day_run_is_selected_when_ggc_passage_is_today(self):
+        calls = []
+
+        def provider(train_number, journey_date, target_station):
+            calls.append(journey_date)
+            return self._status(journey_date)
+
+        status = get_live_status_for_order(self._order(), provider=provider)
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["journey_date"], "2026-08-23")
+        self.assertEqual(calls, [date(2026, 8, 23), date(2026, 8, 22)])
+
+    def test_19037_previous_day_regression_selects_22_aug_run(self):
+        def provider(train_number, journey_date, target_station):
+            if journey_date == date(2026, 8, 23):
+                return self._status(
+                    date(2026, 8, 24),
+                    status="not-started",
+                    expected_arrival=None,
+                )
+            return self._status(date(2026, 8, 23))
+
+        status = get_live_status_for_order(self._order("19037"), provider=provider)
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["journey_date"], "2026-08-22")
+        self.assertEqual(status["expected_arrival"], "2026-08-23T15:34:00+05:30")
+
+    def test_explicit_vendor_journey_date_is_preferred(self):
+        calls = []
+
+        def provider(train_number, journey_date, target_station):
+            calls.append(journey_date)
+            return self._status(date(2026, 8, 23))
+
+        status = get_live_status_for_order(
+            self._order(journey_date=date(2026, 8, 22)), provider=provider
+        )
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["journey_date"], "2026-08-22")
+        self.assertEqual(calls, [date(2026, 8, 22)])
+
+    def test_d_minus_two_is_used_only_when_the_first_two_do_not_match(self):
+        def provider(train_number, journey_date, target_station):
+            passage_date = (
+                date(2026, 8, 23)
+                if journey_date == date(2026, 8, 21)
+                else date(2026, 8, 24)
+            )
+            return self._status(passage_date)
+
+        status = get_live_status_for_order(self._order(), provider=provider)
+
+        self.assertTrue(status["available"])
+        self.assertEqual(status["journey_date"], "2026-08-21")
+
+    def test_ambiguous_runs_are_not_shown(self):
+        def provider(train_number, journey_date, target_station):
+            return self._status(date(2026, 8, 23))
+
+        status = get_live_status_for_order(self._order(), provider=provider)
+
+        self.assertFalse(status["available"])
+        self.assertEqual(status["reason"], "AMBIGUOUS_RUN")
+
+    def test_identical_train_run_uses_one_cached_provider_lookup(self):
+        calls = []
+
+        def provider(train_number, journey_date, target_station):
+            calls.append((train_number, journey_date, target_station))
+            return self._status(date(2026, 8, 23))
+
+        first = self._order(journey_date=date(2026, 8, 22))
+        second = self._order(journey_date=date(2026, 8, 22))
+        get_live_status_for_order(first, provider=provider)
+        get_live_status_for_order(second, provider=provider)
+
+        self.assertEqual(calls, [("19037", date(2026, 8, 22), "GGC")])
+
+    def test_manual_refresh_forces_lookup_and_replaces_cached_eta_for_same_run(self):
+        calls = []
+
+        def initial_provider(train_number, journey_date, target_station):
+            calls.append("initial")
+            return self._status(
+                date(2026, 8, 23), expected_arrival="2026-08-23T15:00:00+05:30"
+            )
+
+        def refreshed_provider(train_number, journey_date, target_station):
+            calls.append("refresh")
+            return self._status(
+                date(2026, 8, 23), expected_arrival="2026-08-23T15:34:00+05:30"
+            )
+
+        first = self._order(journey_date=date(2026, 8, 22))
+        second = self._order(journey_date=date(2026, 8, 22))
+        get_live_status_for_order(first, provider=initial_provider)
+        refreshed = refresh_live_status_for_order(
+            first, date(2026, 8, 22), provider=refreshed_provider
+        )
+        shared = get_live_status_for_order(second, provider=initial_provider)
+
+        self.assertEqual(calls, ["initial", "refresh"])
+        self.assertEqual(refreshed["expected_arrival"], "2026-08-23T15:34:00+05:30")
+        self.assertEqual(shared["expected_arrival"], "2026-08-23T15:34:00+05:30")
+
+    def test_failed_manual_refresh_keeps_last_known_cached_status(self):
+        def working_provider(train_number, journey_date, target_station):
+            return self._status(
+                date(2026, 8, 23), expected_arrival="2026-08-23T15:00:00+05:30"
+            )
+
+        def failing_provider(train_number, journey_date, target_station):
+            raise TrainStatusError("TIMEOUT", "Timed out")
+
+        order = self._order(journey_date=date(2026, 8, 22))
+        original = get_live_status_for_order(order, provider=working_provider)
+        failed = refresh_live_status_for_order(
+            order, date(2026, 8, 22), provider=failing_provider
+        )
+        cached = get_live_status_for_order(order, provider=failing_provider)
+
+        self.assertFalse(failed["available"])
+        self.assertEqual(original["expected_arrival"], cached["expected_arrival"])
+        self.assertEqual(cached["expected_arrival"], "2026-08-23T15:00:00+05:30")
+
+    def test_manual_refresh_does_not_change_a_different_train_run(self):
+        def provider(train_number, journey_date, target_station):
+            eta = "2026-08-23T15:00:00+05:30" if train_number == "19037" else "2026-08-23T16:00:00+05:30"
+            return self._status(date(2026, 8, 23), train_number=train_number, expected_arrival=eta)
+
+        first = self._order("19037", date(2026, 8, 22))
+        second = self._order("12963", date(2026, 8, 22))
+        get_live_status_for_order(first, provider=provider)
+        second_original = get_live_status_for_order(second, provider=provider)
+
+        def refreshed_first_provider(train_number, journey_date, target_station):
+            return self._status(
+                date(2026, 8, 23),
+                train_number=train_number,
+                expected_arrival="2026-08-23T15:34:00+05:30",
+            )
+
+        refresh_live_status_for_order(
+            first, date(2026, 8, 22), provider=refreshed_first_provider
+        )
+        second_after_refresh = get_live_status_for_order(second, provider=provider)
+
+        self.assertEqual(second_original["expected_arrival"], "2026-08-23T16:00:00+05:30")
+        self.assertEqual(second_after_refresh["expected_arrival"], "2026-08-23T16:00:00+05:30")
+
+    def test_different_trains_use_separate_cache_entries(self):
+        calls = []
+
+        def provider(train_number, journey_date, target_station):
+            calls.append(train_number)
+            return self._status(date(2026, 8, 23), train_number=train_number)
+
+        get_live_status_for_order(
+            self._order("19037", date(2026, 8, 22)), provider=provider
+        )
+        get_live_status_for_order(
+            self._order("12963", date(2026, 8, 22)), provider=provider
+        )
+
+        self.assertEqual(calls, ["19037", "12963"])
+
+    def test_provider_timeout_becomes_an_unavailable_result(self):
+        def provider(train_number, journey_date, target_station):
+            raise TrainStatusError("TIMEOUT", "Timed out")
+
+        status = get_live_status_for_order(self._order(), provider=provider)
+
+        self.assertFalse(status["available"])
+        self.assertEqual(status["reason"], "RUN_NOT_RESOLVED")
+
+    def test_dashboard_urgency_states_and_arrived_state(self):
+        now = timezone.make_aware(datetime(2026, 8, 23, 14, 10))
+        status = self._status(
+            date(2026, 8, 23), expected_arrival="2026-08-23T15:30:00+05:30"
+        )
+        self.assertEqual(get_dashboard_status(status, now)["urgency"], "NORMAL")
+
+        status["expected_arrival"] = "2026-08-23T15:00:00+05:30"
+        self.assertEqual(get_dashboard_status(status, now)["urgency"], "APPROACHING")
+
+        status["expected_arrival"] = "2026-08-23T14:30:00+05:30"
+        self.assertEqual(get_dashboard_status(status, now)["urgency"], "URGENT")
+
+        status["target_status"] = "departed"
+        self.assertEqual(get_dashboard_status(status, now)["display_state"], "ARRIVED")
+
+    def test_running_and_not_started_dashboard_states_include_the_right_eta(self):
+        running = get_dashboard_status(
+            self._status(
+                date(2026, 8, 23), expected_arrival="2026-08-23T15:34:00+05:30"
+            ),
+            timezone.make_aware(datetime(2026, 8, 23, 14, 10)),
+        )
+        self.assertEqual(running["display_state"], "LIVE")
+        self.assertEqual(running["expected_arrival_display"], "3:34 PM")
+
+        not_started = get_dashboard_status(
+            self._status(
+                date(2026, 8, 23), status="not-started", expected_arrival=None
+            )
+        )
+        self.assertEqual(not_started["display_state"], "NOT_STARTED")
+        self.assertEqual(not_started["scheduled_arrival_display"], "3:00 PM")
+
+
+def _http_error(status_code):
+    return HTTPError(
+        "https://api.railradar.in/v1/trains/12963/live",
+        status_code,
+        "Provider error",
+        hdrs=None,
+        fp=BytesIO(),
+    )
 
 
 class OrderCreationServiceTests(TestCase):
@@ -143,11 +538,84 @@ class OrderCreationServiceTests(TestCase):
         older_order.order_date = timezone.now() - timedelta(days=1)
         older_order.save(update_fields=["order_date"])
 
-        response = self.client.get(reverse("order_list"))
+        unavailable_status = {
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": None,
+            "scheduled_arrival": None,
+            "expected_arrival": None,
+            "delay_minutes": None,
+            "current_location": None,
+            "next_station": None,
+            "status": None,
+            "target_status": None,
+            "provider": "RailRadar",
+            "available": False,
+            "raw_available": False,
+            "reason": "TIMEOUT",
+        }
+        with patch("Orders.views.get_live_status_for_order", return_value=unavailable_status):
+            response = self.client.get(reverse("order_list"))
 
         self.assertContains(response, "TODAY-ORDER")
         self.assertNotContains(response, "OLDER-ORDER")
+        self.assertContains(response, "UNKNOWN")
         self.assertEqual(response.context["summary"]["total_orders"], 1)
+
+    def test_dashboard_top_date_uses_djangos_current_local_date(self):
+        with patch("Orders.views.get_live_status_for_order", return_value={
+            "available": False,
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": None,
+        }):
+            response = self.client.get(reverse("order_list"))
+
+        self.assertContains(response, timezone.localdate().strftime("%d %b %Y"))
+        self.assertNotContains(response, "12 Aug 2026 - 13 Aug 2026")
+
+    def test_expanded_details_show_items_and_payment_aware_stored_financials_only(self):
+        cod_email = self._email("RailRestro", "expanded-cod")
+        cod_order = create_order_from_incoming_email(
+            cod_email, self._data("EXPANDED-COD", "CASH_ON_DELIVERY")
+        )
+        cod_order.order_date = timezone.now()
+        cod_order.save(update_fields=["order_date"])
+
+        prepaid_email = self._email("HomeBytes", "expanded-prepaid")
+        prepaid_order = create_order_from_incoming_email(
+            prepaid_email, self._data("EXPANDED-PREPAID", "PRE_PAID")
+        )
+        prepaid_order.order_date = timezone.now()
+        prepaid_order.save(update_fields=["order_date"])
+
+        unavailable_status = {
+            "available": False,
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": None,
+            "scheduled_arrival": None,
+            "expected_arrival": None,
+            "delay_minutes": None,
+            "current_location": None,
+            "next_station": None,
+            "status": None,
+            "target_status": None,
+            "provider": "RailRadar",
+            "raw_available": False,
+            "reason": "TIMEOUT",
+        }
+        with patch("Orders.views.get_live_status_for_order", return_value=unavailable_status):
+            response = self.client.get(reverse("order_list"))
+
+        self.assertContains(response, "Veg Cheese Pizza")
+        self.assertContains(response, "Amount Summary")
+        self.assertContains(response, "Delivery Charge")
+        self.assertContains(response, "Amount To Collect")
+        self.assertContains(response, "Prepaid / Paid")
+        self.assertContains(response, "₹315.00")
+        self.assertNotContains(response, '<h2>Customer</h2>', html=True)
+        self.assertNotContains(response, '<h2>Journey</h2>', html=True)
 
     def test_bill_route_marks_an_order_as_printed(self):
         incoming_email = self._email("RailRecipe", "bill-order")
@@ -162,6 +630,69 @@ class OrderCreationServiceTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(order.bill_printed)
         self.assertIsNotNone(order.bill_printed_at)
+
+    def test_manual_train_status_endpoint_returns_refreshed_json_without_writing_order(self):
+        incoming_email = self._email("RailRestro", "manual-refresh-order")
+        order = create_order_from_incoming_email(
+            incoming_email,
+            self._data("MANUAL-REFRESH", "CASH_ON_DELIVERY"),
+        )
+        fresh_status = {
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": "2026-08-11",
+            "scheduled_arrival": "2026-08-11T15:00:00+05:30",
+            "expected_arrival": "2026-08-11T15:34:00+05:30",
+            "delay_minutes": 34,
+            "current_location": "SWM",
+            "next_station": "GGC",
+            "status": "running",
+            "target_status": "upcoming",
+            "provider": "RailRadar",
+            "available": True,
+            "raw_available": True,
+            "fetched_at": timezone.now().isoformat(),
+        }
+
+        with patch(
+            "Orders.views.refresh_live_status_for_order", return_value=fresh_status
+        ):
+            response = self.client.post(
+                reverse("order_train_status_refresh", args=[order.pk]),
+                {"journey_date": "2026-08-11"},
+            )
+            unchanged_response = self.client.post(
+                reverse("order_train_status_refresh", args=[order.pk]),
+                {"journey_date": "2026-08-11"},
+            )
+
+        order.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(unchanged_response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertTrue(unchanged_response.json()["ok"])
+        self.assertEqual(
+            response.json()["status"]["expected_arrival"],
+            unchanged_response.json()["status"]["expected_arrival"],
+        )
+        self.assertEqual(response.json()["status"]["expected_arrival"], "3:34 PM")
+        self.assertEqual(
+            set(response.json()["status"]),
+            {
+                "display_state",
+                "urgency",
+                "scheduled_arrival",
+                "expected_arrival",
+                "delay_minutes",
+                "arriving_in",
+                "updated_label",
+                "journey_date",
+                "fetched_at",
+                "current_location",
+                "next_station",
+            },
+        )
+        self.assertEqual(order.order_number, "MANUAL-REFRESH")
 
     def test_homebytes_operational_datetime_is_saved_to_order(self):
         body = """
@@ -208,6 +739,7 @@ class OrderCreationServiceTests(TestCase):
             Order No. RR-100 Mobile No. 9462623238 Train No. 12963
             Coach/Seat B2 / 36 Order Date Aug 20, 2026
             Delivery Time (ETA) Kota 15:00 Journey Date
+            2026-08-20 15:00
             PAYMENT STATUS PREPAID
         """
 
@@ -225,6 +757,10 @@ class OrderCreationServiceTests(TestCase):
         self.assertEqual(
             parse_railrecipe_email(railrecipe_body)["order_date"],
             "2026-08-20 15:00:00",
+        )
+        self.assertEqual(
+            parse_railrecipe_email(railrecipe_body)["train_journey_date"],
+            "2026-08-20",
         )
 
     def test_railrecipe_normalizes_payment_status_variants(self):
@@ -259,6 +795,193 @@ class OrderCreationServiceTests(TestCase):
         parsed = parse_railrestro_email(body)
 
         self.assertEqual(parsed["payment_mode"], Order.PaymentMode.PRE_PAID)
+
+    def test_railrestro_prepaid_paid_total_becomes_order_total_and_reports_online_value(self):
+        body = """
+            ORDER #: 5773443 Customer: Test Customer M. 9000000000
+            TRAIN: 20178 / TRAIN EXPRESS
+            Delivery Time: 2026-08-23 21:05:00
+            Coact/Seat: B4-29
+            <table>
+              <tr><td>Veg Premium Thali</td><td>Rs. 443</td><td>2</td><td>Rs. 886</td></tr>
+              <tr><td>Choco Lava Cake</td><td>Rs. 72</td><td>1</td><td>Rs. 72</td></tr>
+            </table>
+            GST: Rs. 47.9 Subtotal: Rs. 1005.9 Extra Charges: Rs. 0
+            Cashback: Rs. 0.00 Prepaid: Rs. 1005.9 Paid Total: Rs. 1005.9
+            (Amount to collect) Rs. 0/-
+        """
+        parsed = parse_railrestro_email(body)
+        incoming_email = self._email("RailRestro", "railrestro-prepaid-total")
+        incoming_email.body = body
+        incoming_email.save(update_fields=["body"])
+
+        order = create_order_from_incoming_email(incoming_email, parsed)
+        order.order_date = timezone.now()
+        order.save(update_fields=["order_date"])
+
+        self.assertEqual(parsed["payment_mode"], Order.PaymentMode.PRE_PAID)
+        self.assertEqual(parsed["amount_to_collect"], Decimal("0"))
+        self.assertEqual(parsed["total"], Decimal("1005.9"))
+        self.assertEqual(order.total, Decimal("1005.90"))
+        self.assertEqual(order.subtotal, Decimal("1005.90"))
+
+        paid_total_only_body = """
+            ORDER #: 5773883 Customer: Test Customer M. 9000000001
+            TRAIN: 20178 / TRAIN EXPRESS
+            Delivery Time: 2026-08-23 22:05:00
+            Coact/Seat: B4-30
+            <table><tr><td>Paneer Fried Rice</td><td>Rs. 268</td><td>2</td><td>Rs. 536</td></tr></table>
+            Total: Rs. 536 GST: Rs. 26.8 Subtotal: Rs. 562.8
+            Extra Charges: Rs. 0 Cashback: Rs. 0.00
+            Paid Total: Rs. 562.8 (Amount to collect) Rs. 0/-
+        """
+        paid_total_only = parse_railrestro_email(paid_total_only_body)
+        paid_total_email = self._email("RailRestro", "railrestro-paid-total-only")
+        paid_total_email.body = paid_total_only_body
+        paid_total_email.save(update_fields=["body"])
+        paid_total_order = create_order_from_incoming_email(
+            paid_total_email, paid_total_only
+        )
+        paid_total_order.order_date = timezone.now()
+        paid_total_order.save(update_fields=["order_date"])
+
+        self.assertEqual(paid_total_only["payment_mode"], Order.PaymentMode.PRE_PAID)
+        self.assertIsNone(paid_total_only["advance"])
+        self.assertEqual(paid_total_only["amount_to_collect"], Decimal("0"))
+        self.assertEqual(paid_total_only["subtotal"], Decimal("562.8"))
+        self.assertEqual(paid_total_only["gst"], Decimal("26.8"))
+        self.assertEqual(paid_total_only["total"], Decimal("562.8"))
+        self.assertEqual(paid_total_order.total, Decimal("562.80"))
+        self.assertEqual(paid_total_order.subtotal, Decimal("562.80"))
+
+        response = self.client.get(reverse("reports"))
+        self.assertEqual(response.context["summary"]["online_value"], Decimal("1568.70"))
+
+    def test_railrestro_cod_keeps_collection_total_when_no_final_total_label_exists(self):
+        body = """
+            ORDER #: COD-100 Customer: Test Customer M. 9000000000
+            TRAIN: 20178 / TRAIN EXPRESS
+            Delivery Time: 2026-08-23 21:05:00
+            Coact/Seat: B4-29
+            (Amount to collect) Rs. 837.90
+        """
+
+        parsed = parse_railrestro_email(body)
+
+        self.assertEqual(parsed["payment_mode"], Order.PaymentMode.CASH_ON_DELIVERY)
+        self.assertEqual(parsed["total"], Decimal("837.90"))
+
+    def test_repair_command_updates_only_existing_zero_total_railrestro_prepaid_order(self):
+        body = """
+            ORDER #: RR-REPAIR-1 Customer: Test Customer M. 9000000000
+            TRAIN: 20178 / TRAIN EXPRESS
+            Delivery Time: 2026-08-23 21:05:00
+            Coact/Seat: B4-29
+            <table><tr><td>Veg Premium Thali</td><td>Rs. 443</td><td>2</td><td>Rs. 886</td></tr></table>
+            GST: Rs. 47.9 Subtotal: Rs. 1005.9 Prepaid: Rs. 1005.9
+            Paid Total: Rs. 1005.9 (Amount to collect) Rs. 0/-
+        """
+        incoming_email = self._email("RailRestro", "repair-railrestro-prepaid")
+        incoming_email.body = body
+        incoming_email.save(update_fields=["body"])
+        order = create_order_from_incoming_email(
+            incoming_email, parse_railrestro_email(body)
+        )
+        order.total = Decimal("0.00")
+        order.subtotal = Decimal("0.00")
+        order.save(update_fields=["total", "subtotal"])
+
+        output = StringIO()
+        call_command(
+            "repair_railrestro_prepaid_totals",
+            "--order-number",
+            order.order_number,
+            "--apply",
+            stdout=output,
+        )
+
+        order.refresh_from_db()
+        incoming_email.refresh_from_db()
+        self.assertEqual(order.total, Decimal("1005.90"))
+        self.assertEqual(order.subtotal, Decimal("1005.90"))
+        self.assertEqual(Order.objects.filter(order_number="RR-REPAIR-1").count(), 1)
+        self.assertEqual(incoming_email.order_id, order.id)
+
+    def test_repair_command_dry_run_leaves_correct_total_and_zero_subtotal_unchanged(self):
+        body = """
+            ORDER #: RR-SUBTOTAL-DRY Customer: Test Customer M. 9000000000
+            TRAIN: 20178 / TRAIN EXPRESS
+            Delivery Time: 2026-08-23 21:05:00
+            Coact/Seat: B4-29
+            <table><tr><td>Paneer Fried Rice</td><td>Rs. 268</td><td>2</td><td>Rs. 536</td></tr></table>
+            GST: Rs. 26.8 Subtotal: Rs. 562.8
+            Paid Total: Rs. 562.8 (Amount to collect) Rs. 0/-
+        """
+        incoming_email = self._email("RailRestro", "repair-railrestro-subtotal-dry")
+        incoming_email.body = body
+        incoming_email.save(update_fields=["body"])
+        order = create_order_from_incoming_email(
+            incoming_email, parse_railrestro_email(body)
+        )
+        order.subtotal = Decimal("0.00")
+        order.save(update_fields=["subtotal"])
+
+        output = StringIO()
+        call_command(
+            "repair_railrestro_prepaid_totals",
+            "--order-number",
+            order.order_number,
+            stdout=output,
+        )
+
+        order.refresh_from_db()
+        incoming_email.refresh_from_db()
+        self.assertEqual(order.total, Decimal("562.80"))
+        self.assertEqual(order.subtotal, Decimal("0.00"))
+        self.assertIn(
+            "RR-SUBTOTAL-DRY | ₹0.00 | ₹562.80 | ₹562.80 | "
+            "eligible: repair subtotal only",
+            output.getvalue(),
+        )
+
+    def test_repair_command_repairs_only_subtotal_when_total_is_correct(self):
+        body = """
+            ORDER #: RR-SUBTOTAL-APPLY Customer: Test Customer M. 9000000000
+            TRAIN: 20178 / TRAIN EXPRESS
+            Delivery Time: 2026-08-23 21:05:00
+            Coact/Seat: B4-29
+            <table><tr><td>Paneer Fried Rice</td><td>Rs. 268</td><td>2</td><td>Rs. 536</td></tr></table>
+            GST: Rs. 26.8 Subtotal: Rs. 562.8
+            Paid Total: Rs. 562.8 (Amount to collect) Rs. 0/-
+        """
+        incoming_email = self._email("RailRestro", "repair-railrestro-subtotal-apply")
+        incoming_email.body = body
+        incoming_email.save(update_fields=["body"])
+        order = create_order_from_incoming_email(
+            incoming_email, parse_railrestro_email(body)
+        )
+        order.subtotal = Decimal("0.00")
+        order.gst = Decimal("1.00")
+        order.discount = Decimal("2.00")
+        order.delivery_charge = Decimal("3.00")
+        order.save(update_fields=["subtotal", "gst", "discount", "delivery_charge"])
+
+        call_command(
+            "repair_railrestro_prepaid_totals",
+            "--order-number",
+            order.order_number,
+            "--apply",
+        )
+
+        order.refresh_from_db()
+        incoming_email.refresh_from_db()
+        self.assertEqual(order.total, Decimal("562.80"))
+        self.assertEqual(order.subtotal, Decimal("562.80"))
+        self.assertEqual(order.gst, Decimal("1.00"))
+        self.assertEqual(order.discount, Decimal("2.00"))
+        self.assertEqual(order.delivery_charge, Decimal("3.00"))
+        self.assertEqual(Order.objects.filter(order_number="RR-SUBTOTAL-APPLY").count(), 1)
+        self.assertEqual(incoming_email.order_id, order.id)
 
     def test_gmail_poll_recovers_offline_email_and_skips_it_on_next_cycle(self):
         class FakeMail:
@@ -539,6 +1262,156 @@ class ReportsViewTests(TestCase):
         response = self.client.get(reverse("reports"))
 
         self.assertEqual(response.context["summary"]["total_orders"], 2)
+
+
+class OrderDashboardVersionTests(TestCase):
+    def setUp(self):
+        self.vendor = Vendor.objects.create(
+            name="Dashboard Vendor", email_address="dashboard@example.com"
+        )
+        self.customer = Customer.objects.create(name="Dashboard Customer", phone="9000000000")
+        self.train = Train.objects.create(train_number="12963", train_name="MEWAR EXPRESS")
+
+    def _order(self, number, order_date=None):
+        return Order.objects.create(
+            vendor=self.vendor,
+            order_number=number,
+            customer=self.customer,
+            train=self.train,
+            order_date=order_date or timezone.now(),
+            payment_mode=Order.PaymentMode.PRE_PAID,
+            total=Decimal("100.00"),
+        )
+
+    def _version(self):
+        response = self.client.get(reverse("order_dashboard_version"))
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _live_status(self):
+        return {
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": timezone.localdate().isoformat(),
+            "scheduled_arrival": f"{timezone.localdate().isoformat()}T15:00:00+05:30",
+            "expected_arrival": f"{timezone.localdate().isoformat()}T15:34:00+05:30",
+            "delay_minutes": 34,
+            "current_location": "SWM",
+            "next_station": "GGC",
+            "status": "running",
+            "target_status": "upcoming",
+            "provider": "RailRadar",
+            "available": True,
+            "raw_available": True,
+            "fetched_at": timezone.now().isoformat(),
+        }
+
+    def test_endpoint_returns_the_current_today_scoped_dashboard_version(self):
+        order = self._order("VERSION-ONE")
+
+        version = self._version()
+
+        self.assertEqual(version["date"], timezone.localdate().isoformat())
+        self.assertEqual(version["order_count"], 1)
+        self.assertEqual(version["latest_order_id"], order.id)
+        self.assertEqual(version["token"], f"{version['date']}:1:{order.id}")
+
+    def test_new_orders_change_the_token_and_multiple_new_orders_change_it_once(self):
+        initial = self._version()
+        self._order("VERSION-TWO")
+        self._order("VERSION-THREE")
+
+        updated = self._version()
+
+        self.assertEqual(initial["order_count"], 0)
+        self.assertEqual(updated["order_count"], 2)
+        self.assertNotEqual(initial["token"], updated["token"])
+
+    def test_status_change_does_not_change_the_new_order_token(self):
+        order = self._order("STATUS-ONLY")
+        before = self._version()
+
+        order.status = Order.Status.PREPARING
+        order.save(update_fields=["status"])
+        after = self._version()
+
+        self.assertEqual(before["token"], after["token"])
+
+    def test_yesterdays_order_is_excluded_from_todays_version(self):
+        self._order("YESTERDAY", timezone.now() - timedelta(days=1))
+        today_order = self._order("TODAY")
+
+        version = self._version()
+
+        self.assertEqual(version["order_count"], 1)
+        self.assertEqual(version["latest_order_id"], today_order.id)
+
+    def test_version_endpoint_does_not_call_railradar_or_gmail(self):
+        with patch("Orders.views.get_live_status_for_order") as live_status, patch(
+            "Orders.management.commands.poll_gmail_orders.imaplib.IMAP4_SSL"
+        ) as gmail_connection:
+            response = self.client.get(reverse("order_dashboard_version"))
+
+        self.assertEqual(response.status_code, 200)
+        live_status.assert_not_called()
+        gmail_connection.assert_not_called()
+
+    def test_dashboard_remains_available_without_a_version_endpoint_request(self):
+        self._order("NORMAL-DASHBOARD")
+        unavailable_status = {
+            "available": False,
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": None,
+            "scheduled_arrival": None,
+            "expected_arrival": None,
+            "delay_minutes": None,
+            "current_location": None,
+            "next_station": None,
+            "status": None,
+            "target_status": None,
+            "provider": "RailRadar",
+            "raw_available": False,
+            "reason": "TIMEOUT",
+        }
+        with patch("Orders.views.get_live_status_for_order", return_value=unavailable_status):
+            response = self.client.get(reverse("order_list"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "NORMAL-DASHBOARD")
+
+    def test_same_train_run_shares_live_lookup_while_rendering_eta_columns_per_order(self):
+        self._order("SHARED-ONE")
+        self._order("SHARED-TWO")
+        with patch("Orders.views.get_live_status_for_order", return_value=self._live_status()) as lookup:
+            response = self.client.get(reverse("order_list"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(lookup.call_count, 1)
+        self.assertEqual(response.content.count(b"data-live-eta"), 2)
+        self.assertContains(response, "ETA GGC")
+        self.assertNotContains(response, "Live Train Status")
+
+    def test_different_train_runs_render_dedicated_live_columns_and_clean_train_info(self):
+        self._order("TRAIN-ONE")
+        other_train = Train.objects.create(train_number="19037", train_name="AVADH EXPRESS")
+        Order.objects.create(
+            vendor=self.vendor,
+            order_number="TRAIN-TWO",
+            customer=self.customer,
+            train=other_train,
+            order_date=timezone.now(),
+            payment_mode=Order.PaymentMode.PRE_PAID,
+            total=Decimal("100.00"),
+        )
+        with patch("Orders.views.get_live_status_for_order", return_value=self._live_status()):
+            response = self.client.get(reverse("order_list"))
+
+        self.assertEqual(response.content.count(b"data-live-eta"), 2)
+        self.assertContains(response, "12963 - MEWAR EXPRESS")
+        self.assertContains(response, "19037 - AVADH EXPRESS")
+        self.assertNotContains(response, "Expected GGC:")
+        self.assertContains(response, "Arriving In")
 
 
 class GmailBackfillCommandTests(TestCase):

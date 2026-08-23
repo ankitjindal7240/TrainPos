@@ -1,13 +1,21 @@
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Count, DecimalField, F, Q, Sum, Value
+from django.core.cache import cache
+from django.db.models import Count, DecimalField, F, Max, Q, Sum, Value
 from django.db.models.functions import Coalesce
+from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
+from django.views.decorators.http import require_POST
 
 from Orders.models import Order
+from Orders.services.train_status import (
+    get_dashboard_status,
+    get_live_status_for_order,
+    refresh_live_status_for_order,
+)
 
 
 MONEY_FIELD = DecimalField(max_digits=10, decimal_places=2)
@@ -121,11 +129,103 @@ def order_list(request):
         ready_orders=Count("id", filter=Q(status=Order.Status.READY)),
         cancelled_orders=Count("id", filter=Q(status=Order.Status.CANCELLED)),
     )
+    orders = list(orders)
+    _attach_live_train_statuses(orders)
     return render(
         request,
         "Orders/order_list.html",
-        {"orders": orders, "summary": summary},
+        {
+            "orders": orders,
+            "summary": summary,
+            "dashboard_version": _dashboard_version(),
+            "dashboard_date": timezone.localdate(),
+        },
     )
+
+
+def _attach_live_train_statuses(orders):
+    """Resolve each distinct train/run once for the operational dashboard."""
+    statuses = {}
+    for order in orders:
+        operational_date = timezone.localtime(order.order_date).date()
+        key = (
+            order.train.train_number,
+            order.train_journey_date or operational_date,
+        )
+        if key not in statuses:
+            statuses[key] = get_dashboard_status(get_live_status_for_order(order))
+        order.live_train_status = statuses[key]
+
+    for order in orders:
+        live_status = order.live_train_status
+        journey_date = live_status.get("journey_date") or (
+            order.train_journey_date or timezone.localtime(order.order_date).date()
+        )
+        order.live_train_run_key = f"{order.train.train_number}:{journey_date}:GGC"
+
+
+@require_POST
+def refresh_order_train_status(request, pk):
+    """Manually refresh one resolved run without changing any Order data."""
+    order = get_object_or_404(Order.objects.select_related("train"), pk=pk)
+    journey_date = request.POST.get("journey_date", "")
+    if not journey_date:
+        return JsonResponse({"ok": False, "error": "Refresh failed."}, status=400)
+
+    run_key = f"{order.train.train_number}:{journey_date}:GGC"
+    lock_key = f"trainpos:live-status:refresh:{run_key}"
+    if not cache.add(lock_key, True, timeout=30):
+        return JsonResponse(
+            {"ok": False, "error": "A refresh is already in progress."}, status=429
+        )
+
+    try:
+        status = get_dashboard_status(refresh_live_status_for_order(order, journey_date))
+    finally:
+        cache.delete(lock_key)
+
+    if not status["available"]:
+        return JsonResponse({"ok": False, "error": "Refresh failed."}, status=503)
+    return JsonResponse({"ok": True, "run_key": run_key, "status": _live_status_payload(status)})
+
+
+def _live_status_payload(status):
+    return {
+        "display_state": status["display_state"],
+        "urgency": status["urgency"],
+        "scheduled_arrival": status["scheduled_arrival_display"],
+        "expected_arrival": status["expected_arrival_display"],
+        "delay_minutes": status["delay_minutes"],
+        "arriving_in": status["arriving_in"],
+        "updated_label": status["updated_label"],
+        "journey_date": status["journey_date"],
+        "fetched_at": status.get("fetched_at"),
+        "current_location": status.get("current_location"),
+        "next_station": status.get("next_station"),
+    }
+
+
+def order_dashboard_version(request):
+    """Return a minimal, database-only token for today's operational orders."""
+    return JsonResponse(_dashboard_version())
+
+
+def _dashboard_version():
+    today = timezone.localdate()
+    start = timezone.make_aware(datetime.combine(today, time.min))
+    end = start + timedelta(days=1)
+    version = Order.objects.filter(order_date__gte=start, order_date__lt=end).aggregate(
+        order_count=Count("id"),
+        latest_order_id=Max("id"),
+    )
+    latest_order_id = version["latest_order_id"] or 0
+    order_count = version["order_count"]
+    return {
+        "date": today.isoformat(),
+        "order_count": order_count,
+        "latest_order_id": latest_order_id,
+        "token": f"{today.isoformat()}:{order_count}:{latest_order_id}",
+    }
 
 
 def bill_print(request, pk):

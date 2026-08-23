@@ -4,6 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
   <title>TrainPOS Orders</title>
   <link rel="stylesheet" href="{% static 'Orders/css/order_list.css' %}">
 </head>
@@ -26,12 +27,14 @@
     </aside>
 
     <main class="main-content">
+      <div id="new-order-notice" class="new-order-notice" role="status" aria-live="polite" hidden>New order detected. Reloading orders…</div>
+      <div id="order-dashboard-poll" data-url="{% url 'order_dashboard_version' %}" data-token="{{ dashboard_version.token }}"></div>
       <header class="topbar">
         <div><h1>Orders</h1><p>Manage all incoming orders</p></div>
         <div class="topbar-tools" aria-label="Visual controls">
           <span class="search-placeholder">Search orders, PNR, phone, train... <b>⌕</b></span>
           <span class="tool-button">☷</span>
-          <span class="date-placeholder">▣ 12 Aug 2026 - 13 Aug 2026</span>
+          <span class="date-placeholder">▣ {{ dashboard_date|date:"d M Y" }}</span>
           <span class="bell">♧<i>12</i></span>
           <span class="profile">A</span><span class="admin-label">Admin⌄</span>
         </div>
@@ -59,6 +62,9 @@
                 <th>Payment Type</th>
                 <th>Contact No</th>
                 <th>Train Info : Coach &amp; Seat</th>
+                <th>ETA GGC</th>
+                <th>Delay</th>
+                <th>Arriving In</th>
                 <th>Remarks</th>
                 <th>Actions</th>
               </tr>
@@ -75,20 +81,41 @@
                     <td>{% if schedule %}{{ schedule|date:"H:i" }}{% else %}—{% endif %}</td>
                     <td>{% if order.payment_mode == 'CASH_ON_DELIVERY' %}<span class="payment-badge cod">COD</span>{% else %}<span class="payment-badge online">ONLINE</span>{% endif %}</td>
                     <td>{{ order.customer.phone|default:"—" }}</td>
-                    <td><strong>{{ order.train.train_number }}</strong>{% if order.train.train_name %} · {{ order.train.train_name }}{% endif %} <span class="seat">{{ order.coach|default:"—" }}-{{ order.berth|default:"—" }}</span></td>
+                    <td class="train-info"><strong>{{ order.train.train_number }}{% if order.train.train_name %} - {{ order.train.train_name }}{% endif %}</strong><br><span class="seat">{{ order.coach|default:"—" }}-{{ order.berth|default:"—" }}</span>{% with live=order.live_train_status %}<span class="order-live-indicator urgency-{{ live.urgency|lower }}" data-train-run="{{ order.live_train_run_key }}">{% if live.available %}{% if live.display_state == "LIVE" %}LIVE{% elif live.display_state == "NOT_STARTED" %}NOT STARTED{% else %}REACHED{% endif %}{% else %}UNKNOWN{% endif %}</span>{% if live.available %}<button class="live-refresh" type="button" data-refresh-url="{% url 'order_train_status_refresh' order.pk %}" data-train-run="{{ order.live_train_run_key }}" data-journey-date="{{ live.journey_date }}" aria-label="Refresh {{ order.train.train_number }} live train status" title="Refresh live train status">↻</button><span class="refresh-result" data-refresh-result></span>{% endif %}{% endwith %}</td>
+                    {% with live=order.live_train_status %}
+                      <td class="live-eta" data-live-eta data-train-run="{{ order.live_train_run_key }}">{% if live.available %}{% if live.display_state == "LIVE" %}<b data-eta-value>{{ live.expected_arrival_display|default:"—" }}</b>{% elif live.display_state == "NOT_STARTED" %}<b data-eta-value>{{ live.scheduled_arrival_display|default:"—" }}</b><small data-eta-label>Scheduled</small>{% else %}<b data-eta-value>Reached</b>{% endif %}{% else %}<b data-eta-value>—</b>{% endif %}<small class="live-updated" data-updated-label>{{ live.updated_label|default:"" }}</small></td>
+                      <td class="live-delay{% if live.delay_minutes %} delayed{% endif %}" data-live-delay data-train-run="{{ order.live_train_run_key }}">{% if live.available and live.delay_minutes is not None %}<b data-delay-value>{% if live.delay_minutes %}+{{ live.delay_minutes }} min{% else %}On time{% endif %}</b>{% else %}<b data-delay-value>—</b>{% endif %}</td>
+                      <td class="live-arriving urgency-{{ live.urgency|lower }}" data-live-arriving data-train-run="{{ order.live_train_run_key }}"><b data-arriving-value>{% if live.available %}{% if live.display_state == "LIVE" %}{{ live.arriving_in|default:"—" }}{% elif live.display_state == "NOT_STARTED" %}—{% else %}Reached{% endif %}{% else %}—{% endif %}</b></td>
+                    {% endwith %}
                     <td>—</td>
                     <td><span class="actions"><button type="button" aria-label="Send order">➤</button><a class="bill-button{% if order.bill_printed %} bill-printed{% endif %}" href="{% url 'order_bill' order.pk %}" target="_blank" aria-label="Print bill"{% if order.bill_printed %} title="Bill already printed"{% endif %}>{% if order.bill_printed %}✓{% else %}▣{% endif %}</a><button type="button" aria-label="KOT">KOT</button><button type="button" aria-label="Edit order">✎</button></span></td>
                   </tr>
                   <tr class="order-detail-row" id="order-detail-{{ order.id }}" hidden>
-                    <td colspan="11">
-                      <div class="order-detail">
-                        <div class="detail-section"><h2>Customer</h2><p><b>{{ order.customer.name }}</b><br>{{ order.customer.phone|default:"No phone available" }}</p></div>
-                        <div class="detail-section"><h2>Order</h2><p><b>{{ order.order_number }}</b><br>{{ order.vendor.name }}</p></div>
-                        <div class="detail-section"><h2>Journey</h2><p><b>{{ order.train.train_number }}{% if order.train.train_name %} · {{ order.train.train_name }}{% endif %}</b><br>Coach {{ order.coach|default:"—" }} · Seat {{ order.berth|default:"—" }}<br>PNR: {{ order.pnr|default:"Not available" }}</p></div>
-                        <div class="detail-section"><h2>Order &amp; status</h2><p>{% if schedule %}{{ schedule|date:"d M Y, H:i" }}{% else %}Not available{% endif %}<br>{{ order.get_payment_mode_display }} · {{ order.get_status_display }}</p></div>
-                        <div class="detail-section items-section"><h2>Items</h2><ul>{% for item in order.items.all %}<li>{{ item.item_name }} <span>× {{ item.quantity }}</span></li>{% empty %}<li>No items available</li>{% endfor %}</ul></div>
-                        <div class="detail-section financial-section"><h2>Financial information</h2><p>GST <b>₹{{ order.gst }}</b><br>Discount <b>₹{{ order.discount }}</b><br>Total <b>₹{{ order.total }}</b><br>Amount to collect <b>Not available</b></p></div>
-                        <div class="detail-section"><h2>Remarks</h2><p>Not available</p></div>
+                    <td colspan="14">
+                      <div class="order-detail compact-order-detail">
+                        <section class="detail-items-panel">
+                          <h2>Items</h2>
+                          <table class="detail-items-table">
+                            <thead><tr><th>Item Name</th><th>Qty</th></tr></thead>
+                            <tbody>{% for item in order.items.all %}<tr><td>{{ item.item_name }}</td><td>{{ item.quantity }}</td></tr>{% empty %}<tr><td colspan="2">No items available</td></tr>{% endfor %}</tbody>
+                          </table>
+                          {% if order.remarks %}<div class="detail-remarks"><h2>Remarks</h2><p>{{ order.remarks }}</p></div>{% endif %}
+                        </section>
+                        <section class="detail-financial-panel">
+                          <h2>Amount Summary</h2>
+                          <dl>
+                            <div><dt>Subtotal</dt><dd>₹{{ order.subtotal }}</dd></div>
+                            <div><dt>GST</dt><dd>₹{{ order.gst }}</dd></div>
+                            <div><dt>Delivery Charge</dt><dd>₹{{ order.delivery_charge }}</dd></div>
+                            <div><dt>Discount</dt><dd>₹{{ order.discount }}</dd></div>
+                            <div class="financial-total"><dt>Total</dt><dd>₹{{ order.total }}</dd></div>
+                          </dl>
+                          {% if order.payment_mode == 'CASH_ON_DELIVERY' %}
+                            <div class="payment-total cod-total"><span>Amount To Collect</span><strong>₹{{ order.total }}</strong></div>
+                          {% else %}
+                            <div class="payment-total prepaid-total"><span>Prepaid / Paid</span><strong>₹{{ order.total }}</strong></div>
+                          {% endif %}
+                        </section>
                       </div>
                     </td>
                   </tr>
