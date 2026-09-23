@@ -4,55 +4,58 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
   <title>Bill {{ order.order_number }}</title>
   <link rel="stylesheet" href="{% static 'Orders/css/bill_print.css' %}">
 </head>
 <body>
   <main class="receipt">
     <header class="receipt-header">
-      <h1>Train Order</h1>
-      <strong>Food Costa</strong>
+      <h1>Food Costa</h1>
+      <strong>Train Order</strong>
       <span>{{ restaurant_phone }}</span>
     </header>
 
-    <section class="order-information">
-      <dl>
-        <dt>Order No.</dt><dd>{{ order.order_number }}</dd>
-        <dt>Vendor</dt><dd>{{ order.vendor.name }}</dd>
-        <dt>Date</dt><dd>{% if schedule %}{{ schedule|date:"M d, Y" }}{% else %}—{% endif %}</dd>
-        <dt>Time</dt><dd>{% if schedule %}{{ schedule|date:"H : i" }}{% else %}—{% endif %}</dd>
-        <dt>Customer Name</dt><dd>{{ order.customer.name }}</dd>
-        <dt>Mobile</dt><dd>{{ order.customer.phone|default:"—" }}</dd>
-      </dl>
+    <section class="receipt-details" aria-label="Order details">
+      <div><span>Order</span><b>{{ order.order_number }}</b></div>
+      <div><span>Vendor</span><b>{{ order.vendor.name }}</b></div>
+      <div><span>Date</span><b>{% if schedule %}{{ schedule|date:"d M Y" }}{% else %}—{% endif %}</b></div>
+      <div><span>Time</span><b>{% if schedule %}{{ schedule|date:"H:i" }}{% else %}—{% endif %}</b></div>
+      <div><span>Customer</span><b>{{ order.customer.name }}</b></div>
+      <div><span>Phone</span><b>{{ order.customer.phone|default:"—" }}</b></div>
+      <div><span>Train</span><b>{{ order.train.train_number }}</b></div>
+      <div><span>Coach / Seat</span><b>{{ order.coach|default:"—" }} / {{ order.berth|default:"—" }}</b></div>
+      {% if order.pnr %}
+        <div class="detail-wide"><span>PNR</span><b>{{ order.pnr }}</b></div>
+      {% endif %}
     </section>
 
-    <section class="items-section">
-      <div class="items-heading"><strong>Item</strong><strong>Qty</strong></div>
+    <section class="items-section" aria-label="Order items">
+      <div class="item-row item-heading"><strong>Item</strong><strong>Qty</strong><strong>Amount</strong></div>
       {% for item in order.items.all %}
-        <div class="item-line"><span>{{ item.item_name }}</span><span>{{ item.quantity }}</span></div>
+        <div class="item-row"><span>{{ item.item_name }}</span><span>{{ item.quantity }}</span><span>₹{{ item.amount }}</span></div>
       {% empty %}
-        <div class="item-line"><span>No items available</span><span>—</span></div>
+        <div class="item-row"><span>No items available</span><span>—</span><span>—</span></div>
       {% endfor %}
     </section>
 
-    <section class="financial-section">
+    <section class="financial-section" aria-label="Payment summary">
       <dl>
-        <dt>Remarks:</dt><dd>Not available</dd>
-        <dt>Advance:</dt><dd>₹ {{ advance }}</dd>
-        <dt>GST:</dt><dd>₹ {{ order.gst }}</dd>
-        <dt>Tax:</dt><dd>₹ {{ tax }}</dd>
-        <dt>Discount:</dt><dd>₹ {{ order.discount }}</dd>
-        <dt>Total:</dt><dd>₹ {{ order.total }}</dd>
-        <dt>Amount to collect:</dt><dd>₹ {{ amount_to_collect }}</dd>
+        <div><dt>Subtotal</dt><dd>₹{{ order.subtotal }}</dd></div>
+        <div><dt>GST</dt><dd>₹{{ order.gst }}</dd></div>
+        <div><dt>Discount</dt><dd>₹{{ order.discount }}</dd></div>
+        <div><dt>Delivery Charge</dt><dd>₹{{ order.delivery_charge }}</dd></div>
+        <div class="financial-total"><dt>Total</dt><dd>₹{{ order.total }}</dd></div>
       </dl>
     </section>
 
-    <section class="payment-train-box">
-      <div class="payment-mode">{{ payment_label }}</div>
-      <div class="journey-summary">
-        <div><span>Train number</span><strong>{{ order.train.train_number }}</strong></div>
-        <div><span>Coach / berth</span><strong>{{ order.coach|default:"—" }} / {{ order.berth|default:"—" }}</strong></div>
-      </div>
+    <section class="payment-summary" aria-label="Payment mode">
+      <strong>{{ payment_label }}</strong>
+      {% if order.payment_mode == "PRE_PAID" %}
+        <span>Paid</span><b>₹{{ advance }}</b>
+      {% else %}
+        <span>Amount to collect</span><b>₹{{ amount_to_collect }}</b>
+      {% endif %}
     </section>
   </main>
   <script src="{% static 'Orders/js/bill_print.js' %}"></script>

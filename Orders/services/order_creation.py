@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 from django.db import transaction
 from django.utils import timezone
 
-from Orders.models import Customer, IncomingEmail, Order, OrderItem, Train
+from Orders.models import Customer, IncomingEmail, Order, OrderItem, Train, Vendor
 
 
 def _to_decimal(value):
@@ -42,12 +42,15 @@ def _parse_train_journey_date(train_journey_date):
         ) from error
 
 
-def _get_customer(data):
+def _get_customer(data, restaurant):
     customer_name = (data.get("customer_name") or "").strip()
     customer_phone = (data.get("customer_phone") or "").strip()
 
     if customer_phone:
-        customer = Customer.objects.filter(phone=customer_phone).first()
+        customer = Customer.objects.filter(
+            restaurant=restaurant,
+            phone=customer_phone,
+        ).first()
         if customer:
             if customer_name and customer.name in {"", "Unknown Customer"}:
                 customer.name = customer_name
@@ -55,6 +58,7 @@ def _get_customer(data):
             return customer
 
     return Customer.objects.create(
+        restaurant=restaurant,
         name=customer_name or "Unknown Customer",
         phone=customer_phone,
     )
@@ -103,6 +107,13 @@ def _create_order_items(order, items):
         )
 
 
+def _mark_incoming_email_processed(incoming_email, order):
+    incoming_email.order = order
+    incoming_email.processing_status = IncomingEmail.ProcessingStatus.PROCESSED
+    incoming_email.error_message = ""
+    incoming_email.save(update_fields=["order", "processing_status", "error_message"])
+
+
 def create_order_from_incoming_email(incoming_email, data):
     """Create an order from normalized parser data and mark its email processed.
 
@@ -120,16 +131,34 @@ def create_order_from_incoming_email(incoming_email, data):
                 return incoming_email.order
 
             order_number = (data.get("order_number") or "").strip()
-            payment_mode = data.get("payment_mode")
             if not order_number:
                 raise ValueError("An order number is required to create an order.")
+
+            # Lock the vendor row to serialize business-order creation for that
+            # vendor. The database constraint remains the final guarantee.
+            vendor = Vendor.objects.select_for_update().get(pk=incoming_email.vendor_id)
+            if not vendor.is_active:
+                raise ValueError("The vendor is inactive and cannot create orders.")
+            existing_order = Order.objects.filter(
+                vendor=vendor,
+                order_number=order_number,
+            ).first()
+            if existing_order:
+                _mark_incoming_email_processed(incoming_email, existing_order)
+                return existing_order
+
+            payment_mode = data.get("payment_mode")
             if payment_mode not in Order.PaymentMode.values:
                 raise ValueError("A valid payment mode is required to create an order.")
 
-            customer = _get_customer(data)
+            if incoming_email.restaurant_id != vendor.restaurant_id:
+                raise ValueError("Incoming email and vendor must belong to the same restaurant.")
+
+            customer = _get_customer(data, incoming_email.restaurant)
             train = _get_train(data)
             order = Order.objects.create(
-                vendor=incoming_email.vendor,
+                restaurant=incoming_email.restaurant,
+                vendor=vendor,
                 order_number=order_number,
                 customer=customer,
                 train=train,
@@ -147,16 +176,12 @@ def create_order_from_incoming_email(incoming_email, data):
                 discount=_to_decimal(data.get("discount")),
                 delivery_charge=_to_decimal(data.get("delivery_charge")),
                 total=_to_decimal(data.get("total")),
+                is_demo=vendor.is_demo,
                 status=Order.Status.NEW,
             )
             _create_order_items(order, data.get("order_items"))
 
-            incoming_email.order = order
-            incoming_email.processing_status = IncomingEmail.ProcessingStatus.PROCESSED
-            incoming_email.error_message = ""
-            incoming_email.save(
-                update_fields=["order", "processing_status", "error_message"]
-            )
+            _mark_incoming_email_processed(incoming_email, order)
             return order
     except Exception as error:
         IncomingEmail.objects.filter(

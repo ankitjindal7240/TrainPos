@@ -6,7 +6,7 @@ STATUS_UPDATE = "STATUS_UPDATE"
 
 
 def classify_vendor_email(vendor, subject, body=""):
-    if vendor.name != "RailRestro":
+    if vendor.parser_type != "RAILRESTRO":
         return ORDER
 
     normalized_subject = " ".join((subject or "").split())

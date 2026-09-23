@@ -130,6 +130,17 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
+LOGIN_URL = "/login/"
+
+RESTAURANT_CREDENTIAL_ENCRYPTION_KEY = os.getenv(
+    "RESTAURANT_CREDENTIAL_ENCRYPTION_KEY", ""
+).strip()
+TRAINPOS_DEMO_SENDER_EMAIL = os.getenv("TRAINPOS_DEMO_SENDER_EMAIL", "").strip()
+TRAINPOS_CONTACT_PHONE = os.getenv("TRAINPOS_CONTACT_PHONE", "").strip()
+TRAINPOS_CONTACT_EMAIL = os.getenv("TRAINPOS_CONTACT_EMAIL", "").strip()
+TRAINPOS_CONTACT_WHATSAPP = os.getenv("TRAINPOS_CONTACT_WHATSAPP", "").strip()
+TRAINPOS_SITE_URL = os.getenv("TRAINPOS_SITE_URL", "").strip().rstrip("/")
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 

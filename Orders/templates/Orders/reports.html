@@ -4,6 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
   <title>TrainPOS Reports</title>
   <link rel="stylesheet" href="{% static 'Orders/css/order_list.css' %}">
   <link rel="stylesheet" href="{% static 'Orders/css/reports.css' %}">
@@ -12,18 +13,15 @@
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="{% url 'order_list' %}"><span class="brand-mark">▣</span>TrainPOS</a>
-      <div class="account"><span class="account-icon">⌂</span><span><strong>Food Costa</strong><small>Admin</small></span></div>
+      <details class="account-menu">
+        <summary><span class="account-icon">⌂</span><span><strong>{{ request.user.get_full_name|default:request.user.username }}</strong><small>{{ restaurant.name }}</small></span><b>⌄</b></summary>
+        <div class="account-dropdown"><strong>{{ restaurant.name }}</strong>{% if can_manage_email %}<a href="{% url 'onboarding_email' %}">Manage Gmail</a>{% endif %}{% if request.user.is_superuser %}<a href="{% url 'admin:index' %}">Platform Admin</a>{% endif %}<form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Log out</button></form></div>
+      </details>
       <nav class="side-nav" aria-label="Main navigation">
-        <span class="nav-item">▦ <span>Dashboard</span></span>
         <a class="nav-item" href="{% url 'order_list' %}">▤ <span>Orders</span></a>
-        <span class="nav-item">♧ <span>KOT</span></span>
-        <span class="nav-item">♙ <span>Customers</span></span>
-        <span class="nav-item">▧ <span>Trains</span></span>
-        <span class="nav-item">▣ <span>Vendors</span></span>
         <a class="nav-item active" href="{% url 'reports' %}">▥ <span>Reports</span></a>
-        <span class="nav-item">⚙ <span>Settings</span></span>
+        {% if can_manage_email %}<a class="nav-item" href="{% url 'onboarding_email' %}">✉ <span>Gmail Settings</span></a>{% endif %}
       </nav>
-      <span class="collapse-menu">‹ <span>Collapse Menu</span></span>
     </aside>
 
     <main class="main-content reports-content">

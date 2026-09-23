@@ -3,27 +3,47 @@ from email.message import EmailMessage
 from decimal import Decimal
 from io import BytesIO, StringIO
 import json
+import imaplib
 import os
 import socket
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+from cryptography.fernet import Fernet
+
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.core.cache import cache
-from django.test import SimpleTestCase, TestCase
+from django.core.exceptions import ImproperlyConfigured
+from django.db import IntegrityError, transaction
+from django.contrib import admin
+from django.contrib.auth import get_user_model
+from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
+from django.template.loader import get_template
 from django.urls import reverse
 from django.utils import timezone
 
-from Orders.models import Customer, IncomingEmail, Order, Train, Vendor
+from Orders.models import (
+    Customer,
+    IncomingEmail,
+    Order,
+    Restaurant,
+    RestaurantEmailConnection,
+    RestaurantMembership,
+    Train,
+    Vendor,
+    add_calendar_year,
+)
 from Orders.management.commands.poll_gmail_orders import Command
 from Orders.management.commands.backfill_gmail_orders import Command as BackfillCommand
 from Orders.parsers.homebytes import parse_homebytes_email
+from Orders.parsers.demo import parse_demo_email
 from Orders.parsers.railrecipe import parse_railrecipe_email
 from Orders.parsers.railrestro import parse_railrestro_email
 from Orders.parsers.rajbhog_khana import parse_rajbhog_khana_email
 from Orders.services.order_creation import create_order_from_incoming_email
+from Orders.services.credentials import encrypt_app_password
 from Orders.services.train_status import (
     TrainStatusError,
     get_dashboard_status,
@@ -45,6 +65,47 @@ class RailRadarResponse:
 
     def read(self):
         return json.dumps(self.payload).encode("utf-8")
+
+
+class RestaurantCredentialSettingsTests(SimpleTestCase):
+    @override_settings(RESTAURANT_CREDENTIAL_ENCRYPTION_KEY="")
+    def test_missing_credential_encryption_key_fails_safely(self):
+        with self.assertRaises(ImproperlyConfigured):
+            encrypt_app_password("app-password")
+
+
+@override_settings(TRAINPOS_SITE_URL="https://trainpos.in")
+class PublicSeoTests(SimpleTestCase):
+    def test_landing_page_has_required_content_and_ctas(self):
+        response = self.client.get(reverse("landing"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            "Train Food Order Management Software for Railway Restaurants",
+        )
+        self.assertContains(response, "₹5,999/year")
+        self.assertContains(response, "15-day free trial")
+        self.assertContains(response, reverse("signup"))
+        self.assertContains(response, reverse("login"))
+        self.assertContains(response, 'rel="canonical" href="https://trainpos.in/"')
+        self.assertContains(response, 'application/ld+json')
+
+    def test_robots_and_sitemap_expose_only_public_homepage(self):
+        robots = self.client.get(reverse("robots_txt"))
+        sitemap = self.client.get(reverse("sitemap_xml"))
+
+        self.assertEqual(robots.status_code, 200)
+        self.assertContains(robots, "Disallow: /orders/")
+        self.assertContains(robots, "Sitemap: https://trainpos.in/sitemap.xml")
+        self.assertEqual(sitemap.status_code, 200)
+        self.assertContains(sitemap, "https://trainpos.in/")
+
+    def test_login_is_not_indexable(self):
+        response = self.client.get(reverse("login"))
+
+        self.assertContains(response, "<title>Log in to TrainPOS</title>")
+        self.assertContains(self.client.get(reverse("robots_txt")), "Disallow: /login/")
 
 
 class TrainStatusServiceTests(SimpleTestCase):
@@ -414,23 +475,40 @@ def _http_error(status_code):
 
 class OrderCreationServiceTests(TestCase):
     def setUp(self):
+        self.restaurant = Restaurant.objects.get(slug="food-costa")
+        self.user = get_user_model().objects.create_user(username="food-costa-owner")
+        RestaurantMembership.objects.create(
+            user=self.user,
+            restaurant=self.restaurant,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        self.client.force_login(self.user)
         self.vendors = {
             "RailRestro": Vendor.objects.create(
-                name="RailRestro", email_address="no-reply@railrestro.com"
+                restaurant=self.restaurant,
+                name="RailRestro", email_address="no-reply@railrestro.com",
+                parser_type=Vendor.ParserType.RAILRESTRO,
             ),
             "HomeBytes": Vendor.objects.create(
-                name="HomeBytes", email_address="info@homebytes.co.in"
+                restaurant=self.restaurant,
+                name="HomeBytes", email_address="info@homebytes.co.in",
+                parser_type=Vendor.ParserType.HOMEBYTES,
             ),
             "Rajbhog Khana": Vendor.objects.create(
-                name="Rajbhog Khana", email_address="orders@rajbhogkhana.com"
+                restaurant=self.restaurant,
+                name="Rajbhog Khana", email_address="orders@rajbhogkhana.com",
+                parser_type=Vendor.ParserType.RAJBHOG,
             ),
             "RailRecipe": Vendor.objects.create(
-                name="RailRecipe", email_address="no-reply@railrecipe.com"
+                restaurant=self.restaurant,
+                name="RailRecipe", email_address="no-reply@railrecipe.com",
+                parser_type=Vendor.ParserType.RAILRECIPE,
             ),
         }
 
     def _email(self, vendor_name, message_id):
         return IncomingEmail.objects.create(
+            restaurant=self.restaurant,
             message_id=message_id,
             vendor=self.vendors[vendor_name],
             subject="Test order",
@@ -503,6 +581,62 @@ class OrderCreationServiceTests(TestCase):
         self.assertEqual(first_order.pk, second_order.pk)
         self.assertEqual(Order.objects.count(), 1)
 
+    def test_duplicate_business_order_links_both_emails_without_duplicate_items(self):
+        first_email = self._email("Rajbhog Khana", "rajbhog-duplicate-one")
+        second_email = self._email("Rajbhog Khana", "rajbhog-duplicate-two")
+        data = self._data("RBK001733571", "CASH_ON_DELIVERY")
+
+        first_order = create_order_from_incoming_email(first_email, data)
+        second_order = create_order_from_incoming_email(second_email, data)
+        repeated_order = create_order_from_incoming_email(second_email, data)
+
+        first_email.refresh_from_db()
+        second_email.refresh_from_db()
+        self.assertEqual(first_order.pk, second_order.pk)
+        self.assertEqual(second_order.pk, repeated_order.pk)
+        self.assertEqual(
+            Order.objects.filter(
+                vendor=self.vendors["Rajbhog Khana"], order_number="RBK001733571"
+            ).count(),
+            1,
+        )
+        self.assertEqual(first_order.items.count(), 1)
+        self.assertEqual(first_email.order_id, first_order.id)
+        self.assertEqual(second_email.order_id, first_order.id)
+        self.assertEqual(first_email.processing_status, IncomingEmail.ProcessingStatus.PROCESSED)
+        self.assertEqual(second_email.processing_status, IncomingEmail.ProcessingStatus.PROCESSED)
+
+    def test_same_order_number_is_allowed_for_different_vendors(self):
+        railrestro_email = self._email("RailRestro", "cross-vendor-railrestro")
+        homebytes_email = self._email("HomeBytes", "cross-vendor-homebytes")
+
+        railrestro_order = create_order_from_incoming_email(
+            railrestro_email, self._data("SHARED-ORDER", "CASH_ON_DELIVERY")
+        )
+        homebytes_order = create_order_from_incoming_email(
+            homebytes_email, self._data("SHARED-ORDER", "PRE_PAID")
+        )
+
+        self.assertNotEqual(railrestro_order.pk, homebytes_order.pk)
+        self.assertEqual(Order.objects.filter(order_number="SHARED-ORDER").count(), 2)
+
+    def test_vendor_order_number_unique_constraint_prevents_direct_duplicates(self):
+        incoming_email = self._email("RailRestro", "unique-order-first")
+        order = create_order_from_incoming_email(
+            incoming_email, self._data("UNIQUE-ORDER", "CASH_ON_DELIVERY")
+        )
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Order.objects.create(
+                    restaurant=order.restaurant,
+                    vendor=order.vendor,
+                    order_number=order.order_number,
+                    customer=order.customer,
+                    train=order.train,
+                    payment_mode=Order.PaymentMode.CASH_ON_DELIVERY,
+                )
+
     def test_failed_creation_rolls_back_and_marks_email_failed(self):
         incoming_email = self._email("RailRestro", "failed-email")
         data = self._data("RR-FAILED")
@@ -562,7 +696,7 @@ class OrderCreationServiceTests(TestCase):
         self.assertContains(response, "UNKNOWN")
         self.assertEqual(response.context["summary"]["total_orders"], 1)
 
-    def test_dashboard_top_date_uses_djangos_current_local_date(self):
+    def test_dashboard_version_uses_djangos_current_local_date(self):
         with patch("Orders.views.get_live_status_for_order", return_value={
             "available": False,
             "train_number": "12963",
@@ -571,7 +705,7 @@ class OrderCreationServiceTests(TestCase):
         }):
             response = self.client.get(reverse("order_list"))
 
-        self.assertContains(response, timezone.localdate().strftime("%d %b %Y"))
+        self.assertContains(response, timezone.localdate().isoformat())
         self.assertNotContains(response, "12 Aug 2026 - 13 Aug 2026")
 
     def test_expanded_details_show_items_and_payment_aware_stored_financials_only(self):
@@ -1049,6 +1183,7 @@ class OrderCreationServiceTests(TestCase):
             <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
         """
         IncomingEmail.objects.create(
+            restaurant=self.restaurant,
             message_id="9002",
             vendor=self.vendors["HomeBytes"],
             subject="Existing received order",
@@ -1108,17 +1243,32 @@ class OrderCreationServiceTests(TestCase):
 
 class ReportsViewTests(TestCase):
     def setUp(self):
+        self.restaurant = Restaurant.objects.get(slug="food-costa")
+        self.user = get_user_model().objects.create_user(username="report-owner")
+        RestaurantMembership.objects.create(
+            user=self.user,
+            restaurant=self.restaurant,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        self.client.force_login(self.user)
         self.homebytes = Vendor.objects.create(
+            restaurant=self.restaurant,
             name="HomeBytes", email_address="info@homebytes.co.in"
         )
         self.railrestro = Vendor.objects.create(
+            restaurant=self.restaurant,
             name="RailRestro", email_address="no-reply@railrestro.com"
         )
-        self.customer = Customer.objects.create(name="Report Customer", phone="9000000000")
+        self.customer = Customer.objects.create(
+            restaurant=self.restaurant,
+            name="Report Customer",
+            phone="9000000000",
+        )
         self.train = Train.objects.create(train_number="12963", train_name="MEWAR EXPRESS")
 
     def _order(self, number, order_date, total, payment_mode, vendor=None, status=None):
         return Order.objects.create(
+            restaurant=self.restaurant,
             vendor=vendor or self.homebytes,
             order_number=number,
             customer=self.customer,
@@ -1264,16 +1414,324 @@ class ReportsViewTests(TestCase):
         self.assertEqual(response.context["summary"]["total_orders"], 2)
 
 
+class DemoVendorTests(TestCase):
+    def setUp(self):
+        self.restaurant_a = Restaurant.objects.create(
+            name="Demo Restaurant A",
+            slug="demo-restaurant-a",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+        self.restaurant_b = Restaurant.objects.create(
+            name="Demo Restaurant B",
+            slug="demo-restaurant-b",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+        self.user = get_user_model().objects.create_user(username="demo-owner")
+        RestaurantMembership.objects.create(
+            user=self.user,
+            restaurant=self.restaurant_a,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        self.demo_vendor = Vendor.objects.create(
+            restaurant=self.restaurant_a,
+            name="TrainPOS Demo Vendor",
+            email_address="platform-demo@example.com",
+            parser_type=Vendor.ParserType.DEMO,
+            is_demo=True,
+        )
+        self.real_vendor = Vendor.objects.create(
+            restaurant=self.restaurant_a,
+            name="RailRestro",
+            email_address="no-reply@railrestro.com",
+            parser_type=Vendor.ParserType.RAILRESTRO,
+        )
+
+    def _body(self, order_number, payment="COD", amount_to_collect="304.50"):
+        return f"""
+            ORDER: {order_number}
+            CUSTOMER: Demo Passenger
+            PHONE: 9000000000
+            TRAIN: 12963
+            TRAIN NAME: MEWAR EXPRESS
+            DELIVERY TIME: {timezone.localdate():%Y-%m-%d} 19:30
+            COACH: B2
+            SEAT: 36
+            PAYMENT: {payment}
+
+            ITEM: Demo Veg Thali | 1 | 250.00
+            ITEM: Demo Water Bottle | 2 | 20.00
+
+            GST: 14.50
+            SUBTOTAL: 304.50
+            TOTAL: 304.50
+            AMOUNT TO COLLECT: {amount_to_collect}
+            REMARKS: TrainPOS demonstration order
+        """
+
+    def _railrestro_body(self, order_number):
+        return f"""
+            ORDER #: {order_number} Customer: Real Passenger M. 9000000000
+            TRAIN: 12963 / MEWAR EXPRESS
+            Delivery Time: {timezone.localdate():%Y-%m-%d} 19:30:00
+            Coact/Seat: B2-36
+            <table><tr><td>Real Veg Thali</td><td>Rs. 304.50</td><td>1</td><td>Rs. 304.50</td></tr></table>
+            GST: Rs. 14.50 Subtotal: Rs. 304.50
+            Final Total: Rs. 304.50 (Amount to collect) Rs. 304.50
+            Remarks: real order Best Regards
+        """
+
+    def _message(self, order_number, body=None):
+        message = EmailMessage()
+        message["From"] = "TrainPOS Demo <platform-demo@example.com>"
+        message["Subject"] = f"New Order #{order_number} Received"
+        message["Date"] = timezone.localdate().strftime("%a, %d %b %Y 10:00:00 +0000")
+        message.set_content(body or self._body(order_number), subtype="plain")
+        return message.as_bytes()
+
+    def _mail(self, message):
+        class FakeMail:
+            def uid(self, command, *arguments):
+                if command == "fetch":
+                    return "OK", [(b"message", message)]
+                raise AssertionError(f"Unexpected IMAP command: {command}")
+
+        return FakeMail()
+
+    def _stats(self):
+        return {
+            "checked": 1,
+            "new": 0,
+            "existing_retried": 0,
+            "orders": 0,
+            "skipped": 0,
+            "failures": 0,
+        }
+
+    def test_demo_sender_is_accepted_only_for_its_explicit_tenant_and_uses_normal_pipeline(self):
+        message = self._message("DEMO-TENANT-001")
+        command = Command()
+        tenant_a_stats = self._stats()
+        tenant_b_stats = self._stats()
+
+        command._process_message(
+            self._mail(message), b"demo-message-1", tenant_a_stats, self.restaurant_a
+        )
+        command._process_message(
+            self._mail(message), b"demo-message-1", tenant_b_stats, self.restaurant_b
+        )
+
+        order = Order.objects.get(restaurant=self.restaurant_a, order_number="DEMO-TENANT-001")
+        self.assertTrue(order.is_demo)
+        self.assertEqual(order.vendor, self.demo_vendor)
+        self.assertEqual(order.items.count(), 2)
+        self.assertEqual(tenant_a_stats["orders"], 1)
+        self.assertEqual(tenant_b_stats["orders"], 0)
+        self.assertFalse(IncomingEmail.objects.filter(restaurant=self.restaurant_b).exists())
+        self.assertFalse(Order.objects.filter(restaurant=self.restaurant_b).exists())
+
+    def test_missing_demo_order_is_terminal_and_not_retried(self):
+        body = self._body("DEMO-MISSING-ORDER").replace("ORDER:", "ORDER NUMBER:")
+        message = self._message("DEMO-MISSING-ORDER", body)
+        command = Command()
+
+        first_stats = self._stats()
+        command._process_message(
+            self._mail(message), b"demo-missing-order", first_stats, self.restaurant_a
+        )
+        incoming_email = IncomingEmail.objects.get(message_id="demo-missing-order")
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.INVALID)
+        self.assertEqual(incoming_email.error_message, "Demo email requires ORDER.")
+        self.assertIsNone(incoming_email.order_id)
+        self.assertFalse(Order.objects.filter(order_number="DEMO-MISSING-ORDER").exists())
+
+        repeat_stats = self._stats()
+        command._process_message(
+            self._mail(message), b"demo-missing-order", repeat_stats, self.restaurant_a
+        )
+        self.assertEqual(repeat_stats["existing_retried"], 0)
+        self.assertEqual(repeat_stats["skipped"], 1)
+        self.assertEqual(Order.objects.filter(order_number="DEMO-MISSING-ORDER").count(), 0)
+
+    def test_missing_demo_item_is_terminal(self):
+        body = "\n".join(
+            line
+            for line in self._body("DEMO-MISSING-ITEM").splitlines()
+            if not line.strip().upper().startswith("ITEM:")
+        )
+        stats = self._stats()
+        Command()._process_message(
+            self._mail(self._message("DEMO-MISSING-ITEM", body)),
+            b"demo-missing-item",
+            stats,
+            self.restaurant_a,
+        )
+
+        incoming_email = IncomingEmail.objects.get(message_id="demo-missing-item")
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.INVALID)
+        self.assertIn("requires at least one ITEM line", incoming_email.error_message)
+        self.assertEqual(Order.objects.filter(order_number="DEMO-MISSING-ITEM").count(), 0)
+
+    def test_unexpected_demo_processing_error_remains_retryable(self):
+        message = self._message("DEMO-TRANSIENT-001")
+        command = Command()
+        first_stats = self._stats()
+
+        with patch(
+            "Orders.management.commands.poll_gmail_orders.get_vendor_parser",
+            side_effect=RuntimeError("temporary processing error"),
+        ):
+            command._process_message(
+                self._mail(message), b"demo-transient", first_stats, self.restaurant_a
+            )
+
+        incoming_email = IncomingEmail.objects.get(message_id="demo-transient")
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.FAILED)
+        self.assertIsNone(incoming_email.order_id)
+
+        retry_stats = self._stats()
+        command._process_message(
+            self._mail(message), b"demo-transient", retry_stats, self.restaurant_a
+        )
+        incoming_email.refresh_from_db()
+        order = Order.objects.get(order_number="DEMO-TRANSIENT-001")
+        self.assertEqual(retry_stats["existing_retried"], 1)
+        self.assertEqual(incoming_email.processing_status, IncomingEmail.ProcessingStatus.PROCESSED)
+        self.assertEqual(incoming_email.order, order)
+        self.assertEqual(order.items.count(), 2)
+
+    def test_valid_demo_email_is_idempotently_skipped_after_processing(self):
+        message = self._message("DEMO-IDEMPOTENT-001")
+        command = Command()
+        command._process_message(
+            self._mail(message), b"demo-idempotent", self._stats(), self.restaurant_a
+        )
+        repeat_stats = self._stats()
+        command._process_message(
+            self._mail(message), b"demo-idempotent", repeat_stats, self.restaurant_a
+        )
+
+        order = Order.objects.get(order_number="DEMO-IDEMPOTENT-001")
+        self.assertEqual(repeat_stats["skipped"], 1)
+        self.assertEqual(Order.objects.filter(order_number="DEMO-IDEMPOTENT-001").count(), 1)
+        self.assertEqual(order.items.count(), 2)
+
+    def test_demo_orders_appear_on_dashboard_with_a_badge_but_are_excluded_from_reports(self):
+        demo_email = IncomingEmail.objects.create(
+            restaurant=self.restaurant_a,
+            vendor=self.demo_vendor,
+            message_id="demo-dashboard-email",
+            subject="New demo order",
+            body=self._body("DEMO-DASHBOARD-001"),
+            received_at=timezone.now(),
+        )
+        demo_order = create_order_from_incoming_email(
+            demo_email, parse_demo_email(demo_email.body)
+        )
+        real_email = IncomingEmail.objects.create(
+            restaurant=self.restaurant_a,
+            vendor=self.real_vendor,
+            message_id="real-dashboard-email",
+            subject="New real order",
+            body=self._railrestro_body("REAL-DASHBOARD-001"),
+            received_at=timezone.now(),
+        )
+        real_order = create_order_from_incoming_email(
+            real_email, parse_railrestro_email(real_email.body)
+        )
+
+        self.assertTrue(demo_order.is_demo)
+        self.assertFalse(real_order.is_demo)
+        self.client.force_login(self.user)
+        unavailable_status = {
+            "available": False,
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": None,
+        }
+        with patch("Orders.views.get_live_status_for_order", return_value=unavailable_status):
+            dashboard = self.client.get(reverse("order_list"))
+        report = self.client.get(reverse("reports"))
+
+        self.assertContains(dashboard, "DEMO-DASHBOARD-001")
+        self.assertContains(dashboard, "DEMO")
+        self.assertContains(dashboard, "REAL-DASHBOARD-001")
+        self.assertEqual(report.context["summary"]["total_orders"], 1)
+        self.assertEqual(report.context["summary"]["cod_value"], real_order.total)
+        self.assertEqual(
+            [row["vendor__name"] for row in report.context["vendor_breakdown"]],
+            ["RailRestro"],
+        )
+
+    def test_demo_parser_normalizes_cod_items_financials_and_whitespace(self):
+        body = self._body("DEMO-COD-001").replace("PAYMENT: COD", " payment : cash on delivery ")
+
+        parsed = parse_demo_email(body)
+
+        self.assertEqual(parsed["order_number"], "DEMO-COD-001")
+        self.assertEqual(parsed["payment_mode"], Order.PaymentMode.CASH_ON_DELIVERY)
+        self.assertEqual(parsed["order_date"], f"{timezone.localdate():%Y-%m-%d} 19:30:00")
+        self.assertEqual(parsed["coach"], "B2")
+        self.assertEqual(parsed["berth"], "36")
+        self.assertEqual(parsed["subtotal"], Decimal("304.50"))
+        self.assertEqual(parsed["gst"], Decimal("14.50"))
+        self.assertEqual(parsed["total"], Decimal("304.50"))
+        self.assertEqual(parsed["amount_to_collect"], Decimal("304.50"))
+        self.assertEqual(parsed["remarks"], "TrainPOS demonstration order")
+        self.assertEqual(parsed["order_items"], [
+            {"item_name": "Demo Veg Thali", "quantity": 1, "price": Decimal("250.00"), "amount": Decimal("250.00")},
+            {"item_name": "Demo Water Bottle", "quantity": 2, "price": Decimal("20.00"), "amount": Decimal("40.00")},
+        ])
+
+    def test_demo_parser_normalizes_prepaid(self):
+        parsed = parse_demo_email(self._body("DEMO-PREPAID-001", "pre_paid", "0.00"))
+
+        self.assertEqual(parsed["payment_mode"], Order.PaymentMode.PRE_PAID)
+        self.assertEqual(parsed["amount_to_collect"], Decimal("0.00"))
+        self.assertEqual(parsed["advance"], Decimal("304.50"))
+
+    def test_malformed_demo_email_fails_cleanly(self):
+        malformed = "\n".join(
+            line
+            for line in self._body("DEMO-BAD").splitlines()
+            if not line.strip().upper().startswith("ITEM:")
+        )
+        with self.assertRaisesMessage(ValueError, "requires at least one ITEM line"):
+            parse_demo_email(malformed)
+
+    def test_real_railrestro_parser_remains_independent_of_demo_parser(self):
+        parsed = parse_railrestro_email(self._railrestro_body("REAL-RAILRESTRO-001"))
+
+        self.assertEqual(parsed["order_number"], "REAL-RAILRESTRO-001")
+        self.assertEqual(parsed["payment_mode"], Order.PaymentMode.CASH_ON_DELIVERY)
+        self.assertEqual(parsed["order_items"][0]["item_name"], "Real Veg Thali")
+
+
 class OrderDashboardVersionTests(TestCase):
     def setUp(self):
+        self.restaurant = Restaurant.objects.get(slug="food-costa")
+        self.user = get_user_model().objects.create_user(username="dashboard-owner")
+        RestaurantMembership.objects.create(
+            user=self.user,
+            restaurant=self.restaurant,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        self.client.force_login(self.user)
         self.vendor = Vendor.objects.create(
+            restaurant=self.restaurant,
             name="Dashboard Vendor", email_address="dashboard@example.com"
         )
-        self.customer = Customer.objects.create(name="Dashboard Customer", phone="9000000000")
+        self.customer = Customer.objects.create(
+            restaurant=self.restaurant,
+            name="Dashboard Customer",
+            phone="9000000000",
+        )
         self.train = Train.objects.create(train_number="12963", train_name="MEWAR EXPRESS")
 
     def _order(self, number, order_date=None):
         return Order.objects.create(
+            restaurant=self.restaurant,
             vendor=self.vendor,
             order_number=number,
             customer=self.customer,
@@ -1396,6 +1854,7 @@ class OrderDashboardVersionTests(TestCase):
         self._order("TRAIN-ONE")
         other_train = Train.objects.create(train_number="19037", train_name="AVADH EXPRESS")
         Order.objects.create(
+            restaurant=self.restaurant,
             vendor=self.vendor,
             order_number="TRAIN-TWO",
             customer=self.customer,
@@ -1414,10 +1873,1004 @@ class OrderDashboardVersionTests(TestCase):
         self.assertContains(response, "Arriving In")
 
 
+class TenantIsolationTests(TestCase):
+    def setUp(self):
+        self.restaurant_a = Restaurant.objects.create(
+            name="Restaurant A",
+            slug="restaurant-a",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+        self.restaurant_b = Restaurant.objects.create(
+            name="Restaurant B",
+            slug="restaurant-b",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+        self.user_a = get_user_model().objects.create_user(username="tenant-a")
+        self.user_b = get_user_model().objects.create_user(username="tenant-b")
+        RestaurantMembership.objects.create(
+            user=self.user_a,
+            restaurant=self.restaurant_a,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        RestaurantMembership.objects.create(
+            user=self.user_b,
+            restaurant=self.restaurant_b,
+            role=RestaurantMembership.Role.STAFF,
+        )
+        self.superuser = get_user_model().objects.create_superuser(
+            username="platform-admin",
+            email="platform@example.com",
+            password="test-password",
+        )
+        self.train = Train.objects.create(train_number="12963", train_name="MEWAR EXPRESS")
+        self.vendor_a = Vendor.objects.create(
+            restaurant=self.restaurant_a,
+            name="RailRestro",
+            email_address="no-reply@railrestro.com",
+        )
+        self.vendor_b = Vendor.objects.create(
+            restaurant=self.restaurant_b,
+            name="RailRestro",
+            email_address="no-reply@railrestro.com",
+        )
+        self.customer_a = Customer.objects.create(
+            restaurant=self.restaurant_a, name="Customer A", phone="9000000001"
+        )
+        self.customer_b = Customer.objects.create(
+            restaurant=self.restaurant_b, name="Customer B", phone="9000000002"
+        )
+        self.order_a = self._order(
+            self.restaurant_a, self.vendor_a, self.customer_a, "TENANT-ORDER"
+        )
+        self.order_b = self._order(
+            self.restaurant_b, self.vendor_b, self.customer_b, "TENANT-ORDER"
+        )
+
+    def _order(self, restaurant, vendor, customer, order_number):
+        return Order.objects.create(
+            restaurant=restaurant,
+            vendor=vendor,
+            order_number=order_number,
+            customer=customer,
+            train=self.train,
+            order_date=timezone.now(),
+            payment_mode=Order.PaymentMode.PRE_PAID,
+            total=Decimal("100.00"),
+        )
+
+    def test_vendor_and_message_id_can_repeat_across_restaurants(self):
+        email_a = IncomingEmail.objects.create(
+            restaurant=self.restaurant_a,
+            vendor=self.vendor_a,
+            message_id="same-mailbox-uid",
+            subject="A",
+            body="A",
+            received_at=timezone.now(),
+        )
+        email_b = IncomingEmail.objects.create(
+            restaurant=self.restaurant_b,
+            vendor=self.vendor_b,
+            message_id="same-mailbox-uid",
+            subject="B",
+            body="B",
+            received_at=timezone.now(),
+        )
+
+        self.assertNotEqual(self.vendor_a.pk, self.vendor_b.pk)
+        self.assertNotEqual(email_a.pk, email_b.pk)
+        self.assertEqual(Order.objects.filter(order_number="TENANT-ORDER").count(), 2)
+
+    def test_restaurant_a_only_sees_its_dashboard_and_reports(self):
+        self.client.force_login(self.user_a)
+        unavailable_status = {
+            "available": False,
+            "train_number": "12963",
+            "target_station": "GGC",
+            "journey_date": None,
+        }
+
+        with patch("Orders.views.get_live_status_for_order", return_value=unavailable_status):
+            dashboard = self.client.get(reverse("order_list"))
+        reports_response = self.client.get(reverse("reports"))
+        version = self.client.get(reverse("order_dashboard_version"))
+
+        self.assertContains(dashboard, "TENANT-ORDER")
+        self.assertNotContains(dashboard, "Customer B")
+        self.assertEqual(reports_response.context["summary"]["total_orders"], 1)
+        self.assertEqual(version.json()["order_count"], 1)
+
+    def test_restaurant_a_cannot_access_restaurant_b_order_endpoints(self):
+        self.client.force_login(self.user_a)
+
+        bill_response = self.client.get(reverse("order_bill", args=[self.order_b.pk]))
+        with patch("Orders.views.refresh_live_status_for_order") as refresh:
+            refresh_response = self.client.post(
+                reverse("order_train_status_refresh", args=[self.order_b.pk]),
+                {"journey_date": timezone.localdate().isoformat()},
+            )
+
+        self.assertEqual(bill_response.status_code, 404)
+        self.assertEqual(refresh_response.status_code, 404)
+        refresh.assert_not_called()
+
+    def test_user_without_membership_is_denied_operational_dashboard(self):
+        user = get_user_model().objects.create_user(username="no-membership")
+        self.client.force_login(user)
+
+        response = self.client.get(reverse("order_list"))
+
+        self.assertEqual(response.status_code, 403)
+
+    @override_settings(RESTAURANT_CREDENTIAL_ENCRYPTION_KEY=Fernet.generate_key().decode())
+    def test_restaurant_email_credentials_are_encrypted_and_trial_defaults_apply(self):
+        trial_restaurant = Restaurant.objects.create(name="Trial", slug="trial")
+        connection = RestaurantEmailConnection(
+            restaurant=trial_restaurant,
+            email_address="orders@trial.example.com",
+        )
+        connection.set_app_password("app-password")
+        connection.save()
+
+        self.assertEqual(trial_restaurant.subscription_status, Restaurant.SubscriptionStatus.TRIAL)
+        self.assertTrue(trial_restaurant.is_trial_active)
+        self.assertTrue(trial_restaurant.has_access)
+        self.assertNotEqual(connection.encrypted_app_password, "app-password")
+        self.assertEqual(connection.get_app_password(), "app-password")
+
+    def test_platform_superuser_can_inspect_tenants_in_admin(self):
+        self.client.force_login(self.superuser)
+
+        restaurant_admin = self.client.get(reverse("admin:Orders_restaurant_changelist"))
+        order_admin = self.client.get(reverse("admin:Orders_order_changelist"))
+
+        self.assertEqual(restaurant_admin.status_code, 200)
+        self.assertEqual(order_admin.status_code, 200)
+        self.assertContains(restaurant_admin, "Restaurant A")
+        self.assertContains(restaurant_admin, "Restaurant B")
+        self.assertContains(order_admin, "TENANT-ORDER")
+
+
+class SaaSOnboardingTests(TestCase):
+    password = "Strong-pass-123!"
+
+    def _user_with_membership(self, restaurant, username, role="OWNER"):
+        user = get_user_model().objects.create_user(
+            username=username,
+            email=f"{username}@example.com",
+            password=self.password,
+        )
+        RestaurantMembership.objects.create(
+            user=user,
+            restaurant=restaurant,
+            role=role,
+        )
+        return user
+
+    def _restaurant(self, name, slug):
+        return Restaurant.objects.create(
+            name=name,
+            slug=slug,
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+
+    def test_public_routes_render(self):
+        self.assertEqual(self.client.get(reverse("landing")).status_code, 200)
+        self.assertEqual(self.client.get(reverse("signup")).status_code, 200)
+        self.assertEqual(self.client.get(reverse("login")).status_code, 200)
+        self.assertEqual(self.client.get(reverse("onboarding_email")).status_code, 302)
+
+    def test_successful_signup_creates_trial_restaurant_owner_and_logs_in(self):
+        response = self.client.post(
+            reverse("signup"),
+            {
+                "restaurant_name": "New Railway Foods",
+                "owner_name": "New Owner",
+                "email": "owner@newrailway.example",
+                "phone": "9000000000",
+                "password": self.password,
+                "confirm_password": self.password,
+            },
+        )
+
+        user = get_user_model().objects.get(email="owner@newrailway.example")
+        restaurant = Restaurant.objects.get(email="owner@newrailway.example")
+        membership = RestaurantMembership.objects.get(user=user, restaurant=restaurant)
+        self.assertRedirects(response, reverse("onboarding_email"))
+        self.assertEqual(membership.role, RestaurantMembership.Role.OWNER)
+        self.assertEqual(restaurant.subscription_status, Restaurant.SubscriptionStatus.TRIAL)
+        self.assertTrue(restaurant.is_trial_active)
+        self.assertEqual((restaurant.trial_ends_at - restaurant.trial_started_at).days, 15)
+        self.assertEqual(str(self.client.session["_auth_user_id"]), str(user.pk))
+
+    def test_signup_rolls_back_every_record_when_membership_creation_fails(self):
+        with patch(
+            "Orders.views.RestaurantMembership.objects.create",
+            side_effect=IntegrityError("membership failure"),
+        ):
+            response = self.client.post(
+                reverse("signup"),
+                {
+                    "restaurant_name": "Rollback Foods",
+                    "owner_name": "Rollback Owner",
+                    "email": "rollback@example.com",
+                    "phone": "9000000000",
+                    "password": self.password,
+                    "confirm_password": self.password,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(get_user_model().objects.filter(email="rollback@example.com").exists())
+        self.assertFalse(Restaurant.objects.filter(name="Rollback Foods").exists())
+
+    def test_duplicate_and_invalid_signup_are_rejected(self):
+        get_user_model().objects.create_user(
+            username="taken@example.com",
+            email="taken@example.com",
+            password=self.password,
+        )
+        response = self.client.post(
+            reverse("signup"),
+            {
+                "restaurant_name": "Duplicate Foods",
+                "owner_name": "Owner",
+                "email": "taken@example.com",
+                "phone": "",
+                "password": self.password,
+                "confirm_password": "different-password",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "An account with this email already exists.")
+        self.assertContains(response, "Phone is required.")
+        self.assertContains(response, "Passwords do not match.")
+
+    def test_login_and_logout_flow(self):
+        restaurant = self._restaurant("Login Foods", "login-foods")
+        user = self._user_with_membership(restaurant, "login-owner")
+
+        login_response = self.client.post(
+            reverse("login"),
+            {"username": user.username, "password": self.password},
+        )
+        self.assertRedirects(login_response, reverse("order_list"))
+        logout_response = self.client.post(reverse("logout"))
+
+        self.assertRedirects(logout_response, reverse("landing"))
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_owner_can_manage_email_but_staff_cannot(self):
+        restaurant = self._restaurant("Email Foods", "email-foods")
+        owner = self._user_with_membership(restaurant, "email-owner")
+        staff = self._user_with_membership(
+            restaurant, "email-staff", RestaurantMembership.Role.STAFF
+        )
+
+        self.client.force_login(owner)
+        self.assertEqual(self.client.get(reverse("onboarding_email")).status_code, 200)
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get(reverse("onboarding_email")).status_code, 403)
+
+    @override_settings(RESTAURANT_CREDENTIAL_ENCRYPTION_KEY=Fernet.generate_key().decode())
+    def test_owner_saves_encrypted_credential_and_successful_connection(self):
+        restaurant = self._restaurant("Connection Foods", "connection-foods")
+        owner = self._user_with_membership(restaurant, "connection-owner")
+        self.client.force_login(owner)
+
+        with patch("Orders.views.test_gmail_connection", return_value=True) as connection_test:
+            response = self.client.post(
+                reverse("onboarding_email"),
+                {
+                    "email_address": "orders@connection.example.com",
+                    "app_password": "test-app-password",
+                    "action": "test",
+                },
+                follow=True,
+            )
+
+        connection = RestaurantEmailConnection.objects.get(restaurant=restaurant)
+        self.assertTrue(connection.is_active)
+        self.assertEqual(
+            connection.connection_status,
+            RestaurantEmailConnection.ConnectionStatus.CONNECTED,
+        )
+        self.assertNotEqual(connection.encrypted_app_password, "test-app-password")
+        self.assertEqual(connection.get_app_password(), "test-app-password")
+        self.assertContains(response, "Email connected successfully.")
+        connection_test.assert_called_once_with(
+            "orders@connection.example.com", "test-app-password"
+        )
+
+    @override_settings(RESTAURANT_CREDENTIAL_ENCRYPTION_KEY=Fernet.generate_key().decode())
+    def test_failed_connection_does_not_expose_app_password_or_cross_tenant_data(self):
+        restaurant_a = self._restaurant("Connection A", "connection-a")
+        restaurant_b = self._restaurant("Connection B", "connection-b")
+        owner_a = self._user_with_membership(restaurant_a, "connection-a-owner")
+        connection_b = RestaurantEmailConnection(
+            restaurant=restaurant_b,
+            email_address="orders@b.example.com",
+        )
+        connection_b.set_app_password("restaurant-b-secret")
+        connection_b.save()
+        encrypted_b = connection_b.encrypted_app_password
+        self.client.force_login(owner_a)
+
+        with patch("Orders.views.test_gmail_connection", return_value=False):
+            response = self.client.post(
+                reverse("onboarding_email"),
+                {
+                    "email_address": "orders@a.example.com",
+                    "app_password": "restaurant-a-secret",
+                    "action": "test",
+                },
+                follow=True,
+            )
+
+        connection_b.refresh_from_db()
+        connection_a = RestaurantEmailConnection.objects.get(restaurant=restaurant_a)
+        self.assertFalse(connection_a.is_active)
+        self.assertEqual(
+            connection_a.connection_status,
+            RestaurantEmailConnection.ConnectionStatus.ERROR,
+        )
+        self.assertEqual(connection_b.encrypted_app_password, encrypted_b)
+        self.assertContains(
+            response,
+            "Could not connect to Gmail. Please verify the email and App Password.",
+        )
+        self.assertNotContains(response, "restaurant-a-secret")
+        self.assertNotContains(response, "restaurant-b-secret")
+
+    def test_imap_connection_helper_only_logs_in_and_logs_out(self):
+        class FakeMail:
+            def login(self, email_address, app_password):
+                self.credentials = (email_address, app_password)
+
+            def logout(self):
+                self.logged_out = True
+
+        fake_mail = FakeMail()
+        with patch(
+            "Orders.services.gmail_connection.imaplib.IMAP4_SSL",
+            return_value=fake_mail,
+        ):
+            from Orders.services.gmail_connection import test_gmail_connection
+
+            self.assertTrue(test_gmail_connection("orders@example.com", "app-password"))
+
+        self.assertEqual(fake_mail.credentials, ("orders@example.com", "app-password"))
+        self.assertTrue(fake_mail.logged_out)
+        self.assertFalse(hasattr(fake_mail, "select"))
+
+    def test_active_trial_access_expired_trial_block_and_food_costa_active_access(self):
+        trial = Restaurant.objects.create(name="Active Trial", slug="active-trial")
+        trial_user = self._user_with_membership(trial, "trial-owner")
+        self.client.force_login(trial_user)
+        self.assertEqual(self.client.get(reverse("order_list")).status_code, 200)
+
+        trial.trial_ends_at = timezone.now() - timedelta(minutes=1)
+        trial.save(update_fields=["trial_ends_at"])
+        expired_response = self.client.get(reverse("order_list"))
+        self.assertEqual(expired_response.status_code, 403)
+        self.assertContains(expired_response, "trial has ended", status_code=403)
+
+        food_costa = Restaurant.objects.get(slug="food-costa")
+        food_costa_user = self._user_with_membership(food_costa, "food-costa-owner")
+        self.client.force_login(food_costa_user)
+        self.assertEqual(food_costa.subscription_status, Restaurant.SubscriptionStatus.ACTIVE)
+        self.assertEqual(self.client.get(reverse("order_list")).status_code, 200)
+
+
+class AuthenticatedNavigationTests(TestCase):
+    def setUp(self):
+        self.restaurant = Restaurant.objects.get(slug="food-costa")
+        self.user = get_user_model().objects.create_user(
+            username="nav-owner",
+            first_name="Ankit",
+            password="test-password",
+        )
+        RestaurantMembership.objects.create(
+            user=self.user,
+            restaurant=self.restaurant,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        self.client.force_login(self.user)
+
+    def test_owner_sees_only_current_mvp_navigation_and_account_controls(self):
+        response = self.client.get(reverse("order_list"))
+
+        self.assertContains(response, '<meta name="robots" content="noindex,nofollow">')
+        self.assertContains(response, "Orders")
+        self.assertContains(response, "Reports")
+        self.assertContains(response, "Gmail Settings")
+        self.assertContains(response, reverse("onboarding_email"))
+        self.assertContains(response, "Manage Gmail")
+        self.assertContains(response, "Log out")
+        self.assertContains(response, "Ankit")
+        self.assertNotContains(response, ">Dashboard<", html=False)
+        self.assertNotContains(response, ">KOT<", html=False)
+        self.assertNotContains(response, ">Customers<", html=False)
+        self.assertNotContains(response, ">Trains<", html=False)
+        self.assertNotContains(response, ">Vendors<", html=False)
+        self.assertNotContains(response, "Search orders, PNR, phone, train...")
+        self.assertNotContains(response, "Platform Admin")
+
+    def test_logout_remains_post_only(self):
+        self.assertEqual(self.client.get(reverse("logout")).status_code, 405)
+        response = self.client.post(reverse("logout"))
+        self.assertRedirects(response, reverse("landing"))
+
+    def test_superuser_account_dropdown_includes_platform_admin(self):
+        superuser = get_user_model().objects.create_superuser(
+            username="platform-nav-admin",
+            email="platform-nav-admin@example.com",
+            password="admin-password",
+        )
+        request = RequestFactory().get(reverse("order_list"))
+        request.user = superuser
+        html = get_template("Orders/order_list.html").render(
+            {
+                "restaurant": self.restaurant,
+                "orders": [],
+                "summary": {},
+                "dashboard_version": SimpleNamespace(token="navigation-test"),
+                "dashboard_date": timezone.localdate(),
+                "can_manage_email": False,
+                "has_active_email_connection": True,
+            },
+            request,
+        )
+
+        self.assertIn("Platform Admin", html)
+        self.assertIn(reverse("admin:index"), html)
+
+
+class SubscriptionAccessTests(TestCase):
+    def _restaurant(self, slug, status=Restaurant.SubscriptionStatus.TRIAL, **values):
+        return Restaurant.objects.create(
+            name=slug.replace("-", " ").title(),
+            slug=slug,
+            subscription_status=status,
+            **values,
+        )
+
+    def _user_for(self, restaurant, username):
+        user = get_user_model().objects.create_user(username=username, password="test-password")
+        RestaurantMembership.objects.create(
+            user=user,
+            restaurant=restaurant,
+            role=RestaurantMembership.Role.OWNER,
+        )
+        self.client.force_login(user)
+        return user
+
+    def test_fresh_trial_and_active_future_subscription_have_access(self):
+        trial = self._restaurant("fresh-trial")
+        self._user_for(trial, "fresh-trial-owner")
+        self.assertEqual(self.client.get(reverse("order_list")).status_code, 200)
+
+        active = self._restaurant(
+            "paid-active",
+            Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_started_at=timezone.now(),
+            subscription_ends_at=timezone.now() + timedelta(days=30),
+        )
+        self._user_for(active, "paid-active-owner")
+        self.assertEqual(self.client.get(reverse("order_list")).status_code, 200)
+
+    @override_settings(
+        TRAINPOS_CONTACT_PHONE="+91 90000 00000",
+        TRAINPOS_CONTACT_EMAIL="team@example.com",
+        TRAINPOS_CONTACT_WHATSAPP="+91 91111 11111",
+    )
+    def test_expired_trial_is_blocked_and_shows_configured_contact_details(self):
+        restaurant = self._restaurant(
+            "expired-trial",
+            trial_ends_at=timezone.now() - timedelta(seconds=1),
+        )
+        self._user_for(restaurant, "expired-trial-owner")
+
+        response = self.client.get(reverse("order_list"))
+
+        restaurant.refresh_from_db()
+        self.assertEqual(response.status_code, 403)
+        self.assertContains(response, "Your 15-day TrainPOS trial has ended.", status_code=403)
+        self.assertContains(response, "+91 90000 00000", status_code=403)
+        self.assertContains(response, "team@example.com", status_code=403)
+        self.assertContains(response, "+91 91111 11111", status_code=403)
+        self.assertEqual(restaurant.subscription_status, Restaurant.SubscriptionStatus.EXPIRED)
+
+    def test_expired_active_and_expired_or_suspended_statuses_are_blocked(self):
+        expired_active = self._restaurant(
+            "expired-active",
+            Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_started_at=timezone.now() - timedelta(days=365),
+            subscription_ends_at=timezone.now() - timedelta(seconds=1),
+        )
+        self._user_for(expired_active, "expired-active-owner")
+        response = self.client.get(reverse("order_list"))
+        expired_active.refresh_from_db()
+        self.assertEqual(response.status_code, 403)
+        self.assertContains(response, "Your TrainPOS subscription has expired.", status_code=403)
+        self.assertEqual(expired_active.subscription_status, Restaurant.SubscriptionStatus.EXPIRED)
+
+        explicitly_expired = self._restaurant(
+            "explicitly-expired", Restaurant.SubscriptionStatus.EXPIRED
+        )
+        self._user_for(explicitly_expired, "explicitly-expired-owner")
+        self.assertEqual(self.client.get(reverse("order_list")).status_code, 403)
+
+        suspended = self._restaurant(
+            "suspended", Restaurant.SubscriptionStatus.SUSPENDED
+        )
+        self._user_for(suspended, "suspended-owner")
+        self.assertEqual(self.client.get(reverse("order_list")).status_code, 403)
+
+    def test_food_costa_compatibility_subscription_is_active(self):
+        food_costa = Restaurant.objects.get(slug="food-costa")
+        self.assertEqual(food_costa.subscription_status, Restaurant.SubscriptionStatus.ACTIVE)
+        self.assertIsNotNone(food_costa.subscription_ends_at)
+        self.assertTrue(food_costa.has_access)
+
+    def test_restaurant_owner_cannot_change_subscription_through_admin_url(self):
+        restaurant = self._restaurant("owner-cannot-bill")
+        self._user_for(restaurant, "owner-cannot-bill-user")
+        original_status = restaurant.subscription_status
+
+        response = self.client.post(
+            reverse("admin:Orders_restaurant_change", args=[restaurant.pk]),
+            {"subscription_status": Restaurant.SubscriptionStatus.ACTIVE},
+        )
+
+        restaurant.refresh_from_db()
+        self.assertIn(response.status_code, {302, 403})
+        self.assertEqual(restaurant.subscription_status, original_status)
+
+
+class SubscriptionAdminTests(TestCase):
+    def setUp(self):
+        self.superuser = get_user_model().objects.create_superuser(
+            username="subscription-admin",
+            email="subscription-admin@example.com",
+            password="admin-password",
+        )
+        self.client.force_login(self.superuser)
+
+    def _restaurant(self, slug, **values):
+        return Restaurant.objects.create(name=slug, slug=slug, **values)
+
+    def _activate(self, *restaurants):
+        return self.client.post(
+            reverse("admin:Orders_restaurant_changelist"),
+            {
+                "action": "activate_or_extend_subscription_one_year",
+                "_selected_action": [str(restaurant.pk) for restaurant in restaurants],
+            },
+            follow=True,
+        )
+
+    def test_activate_one_year_and_early_or_expired_renewal(self):
+        now = timezone.make_aware(datetime(2026, 8, 28, 10, 0))
+        trial = self._restaurant("subscription-trial")
+        future_end = timezone.make_aware(datetime(2027, 1, 15, 10, 0))
+        early = self._restaurant(
+            "subscription-early",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_started_at=timezone.make_aware(datetime(2026, 1, 15, 10, 0)),
+            subscription_ends_at=future_end,
+        )
+        expired = self._restaurant(
+            "subscription-expired",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_started_at=timezone.make_aware(datetime(2025, 8, 28, 10, 0)),
+            subscription_ends_at=now - timedelta(seconds=1),
+        )
+
+        with patch("Orders.admin.timezone.now", return_value=now):
+            response = self._activate(trial, early, expired)
+
+        trial.refresh_from_db()
+        early.refresh_from_db()
+        expired.refresh_from_db()
+        self.assertEqual(trial.subscription_status, Restaurant.SubscriptionStatus.ACTIVE)
+        self.assertEqual(trial.subscription_started_at, now)
+        self.assertEqual(trial.subscription_ends_at, add_calendar_year(now))
+        self.assertEqual(early.subscription_started_at, timezone.make_aware(datetime(2026, 1, 15, 10, 0)))
+        self.assertEqual(early.subscription_ends_at, add_calendar_year(future_end))
+        self.assertEqual(expired.subscription_started_at, now)
+        self.assertEqual(expired.subscription_ends_at, add_calendar_year(now))
+        self.assertTrue(trial.is_active)
+        self.assertContains(response, "Subscription activated for 2 restaurant")
+        self.assertContains(response, "extended for 1 restaurant")
+
+    def test_admin_form_allows_custom_subscription_dates(self):
+        restaurant = self._restaurant("custom-subscription")
+        model_admin = admin.site._registry[Restaurant]
+        request = RequestFactory().get("/admin/")
+        request.user = self.superuser
+        form_class = model_admin.get_form(request, restaurant)
+        self.assertIn("subscription_started_at", form_class.base_fields)
+        self.assertIn("subscription_ends_at", form_class.base_fields)
+        self.assertIn("subscription_status", form_class.base_fields)
+
+        custom_start = timezone.make_aware(datetime(2026, 9, 1, 9, 0))
+        custom_end = timezone.make_aware(datetime(2028, 2, 29, 9, 0))
+        form = form_class(
+            data={
+                "name": restaurant.name,
+                "slug": restaurant.slug,
+                "owner_name": "",
+                "phone": "",
+                "email": "",
+                "is_active": "on",
+                "trial_started_at_0": restaurant.trial_started_at.strftime("%Y-%m-%d"),
+                "trial_started_at_1": restaurant.trial_started_at.strftime("%H:%M:%S"),
+                "trial_ends_at_0": restaurant.trial_ends_at.strftime("%Y-%m-%d"),
+                "trial_ends_at_1": restaurant.trial_ends_at.strftime("%H:%M:%S"),
+                "subscription_status": Restaurant.SubscriptionStatus.ACTIVE,
+                "subscription_started_at_0": custom_start.strftime("%Y-%m-%d"),
+                "subscription_started_at_1": custom_start.strftime("%H:%M:%S"),
+                "subscription_ends_at_0": custom_end.strftime("%Y-%m-%d"),
+                "subscription_ends_at_1": custom_end.strftime("%H:%M:%S"),
+            },
+            instance=restaurant,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        restaurant.refresh_from_db()
+        self.assertEqual(restaurant.subscription_ends_at, custom_end)
+
+
+class DemoVendorAdminTests(TestCase):
+    def setUp(self):
+        self.superuser = get_user_model().objects.create_superuser(
+            username="platform-admin",
+            email="platform-admin@example.com",
+            password="admin-password",
+        )
+        self.restaurant_a = Restaurant.objects.create(
+            name="Admin Demo A",
+            slug="admin-demo-a",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+        self.restaurant_b = Restaurant.objects.create(
+            name="Admin Demo B",
+            slug="admin-demo-b",
+            subscription_status=Restaurant.SubscriptionStatus.ACTIVE,
+            subscription_ends_at=timezone.now() + timedelta(days=366),
+        )
+        self.client.force_login(self.superuser)
+
+    def _run_demo_action(self, *restaurants):
+        return self.client.post(
+            reverse("admin:Orders_restaurant_changelist"),
+            {
+                "action": "create_trainpos_demo_vendor",
+                "_selected_action": [str(restaurant.pk) for restaurant in restaurants],
+            },
+            follow=True,
+        )
+
+    @override_settings(TRAINPOS_DEMO_SENDER_EMAIL="platform-demo@example.com")
+    def test_admin_action_creates_and_idempotently_reenables_tenant_demo_vendor(self):
+        response = self._run_demo_action(self.restaurant_a)
+
+        demo_vendor = Vendor.objects.get(restaurant=self.restaurant_a)
+        self.assertEqual(demo_vendor.name, "TrainPOS Demo Vendor")
+        self.assertEqual(demo_vendor.email_address, "platform-demo@example.com")
+        self.assertEqual(demo_vendor.parser_type, Vendor.ParserType.DEMO)
+        self.assertTrue(demo_vendor.is_demo)
+        self.assertTrue(demo_vendor.is_active)
+        self.assertFalse(Vendor.objects.filter(restaurant=self.restaurant_b).exists())
+        self.assertContains(response, "Demo Vendor configured for 1 restaurant")
+
+        demo_vendor.is_active = False
+        demo_vendor.parser_type = Vendor.ParserType.RAILRESTRO
+        demo_vendor.save(update_fields=["is_active", "parser_type"])
+        self._run_demo_action(self.restaurant_a)
+
+        self.assertEqual(Vendor.objects.filter(restaurant=self.restaurant_a).count(), 1)
+        demo_vendor.refresh_from_db()
+        self.assertTrue(demo_vendor.is_active)
+        self.assertEqual(demo_vendor.parser_type, Vendor.ParserType.DEMO)
+
+    @override_settings(TRAINPOS_DEMO_SENDER_EMAIL="")
+    def test_admin_action_handles_missing_demo_sender_without_creating_vendor(self):
+        response = self._run_demo_action(self.restaurant_a)
+
+        self.assertFalse(Vendor.objects.filter(restaurant=self.restaurant_a).exists())
+        self.assertContains(response, "Set TRAINPOS_DEMO_SENDER_EMAIL")
+
+
+@override_settings(RESTAURANT_CREDENTIAL_ENCRYPTION_KEY=Fernet.generate_key().decode())
+class MultiRestaurantPollingTests(TestCase):
+    class FakeMail:
+        def __init__(self, message, login_error=None):
+            self.message = message
+            self.login_error = login_error
+            self.logged_out = False
+
+        def login(self, email_address, app_password):
+            self.credentials = (email_address, app_password)
+            if self.login_error:
+                raise self.login_error
+
+        def select(self, mailbox):
+            self.selected_mailbox = mailbox
+            return "OK", [b""]
+
+        def uid(self, command, *arguments):
+            if command == "search":
+                return "OK", [b"100"]
+            if command == "fetch":
+                return "OK", [(b"message", self.message)]
+            raise AssertionError(f"Unexpected IMAP command: {command}")
+
+        def logout(self):
+            self.logged_out = True
+
+    def _restaurant(self, name, slug, status=Restaurant.SubscriptionStatus.ACTIVE):
+        values = {"name": name, "slug": slug, "subscription_status": status}
+        if status == Restaurant.SubscriptionStatus.ACTIVE:
+            values["subscription_ends_at"] = timezone.now() + timedelta(days=366)
+        return Restaurant.objects.create(**values)
+
+    def _vendor(self, restaurant):
+        return Vendor.objects.create(
+            restaurant=restaurant,
+            name="HomeBytes",
+            email_address="info@homebytes.co.in",
+            parser_type=Vendor.ParserType.HOMEBYTES,
+        )
+
+    def _connection(self, restaurant, address):
+        connection = RestaurantEmailConnection(restaurant=restaurant, email_address=address)
+        connection.set_app_password("tenant-app-password")
+        connection.save()
+        return connection
+
+    def _message(self, order_number):
+        today = timezone.localdate()
+        body = f"""
+            Booking Date: {today:%d %b %Y}, 09:30<br>
+            Delivery Date: {today:%d %b %Y}, 10:00<br>
+            Customer Name : Tenant Customer<br>
+            Customer Contact : 9000000000<br>
+            Invoice {order_number} / 2470000000<br>
+            Payment: PRE_PAID<br>
+            Coach / Berth: B2 / 36<br>
+            Train: 12963 / MEWAR EXPRESS<br>
+            GST (5%) 15.00 Discount 0.00 Total: 315.00
+            <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
+        """
+        message = EmailMessage()
+        message["From"] = "HomeBytes <info@homebytes.co.in>"
+        message["Subject"] = f"HomeBytes {order_number}"
+        message["Date"] = today.strftime("%a, %d %b %Y 10:00:00 +0000")
+        message.set_content(body, subtype="html")
+        return message.as_bytes()
+
+    def test_two_restaurants_process_same_mail_id_and_order_number_independently(self):
+        restaurant_a = self._restaurant("Polling A", "polling-a")
+        restaurant_b = self._restaurant("Polling B", "polling-b")
+        self._vendor(restaurant_a)
+        self._vendor(restaurant_b)
+        connection_a = self._connection(restaurant_a, "a@example.com")
+        connection_b = self._connection(restaurant_b, "b@example.com")
+        command = Command()
+        mail_a = self.FakeMail(self._message("HB-SHARED"))
+        mail_b = self.FakeMail(self._message("HB-SHARED"))
+
+        with patch.object(command, "_legacy_food_costa_mailbox", return_value=None), patch(
+            "Orders.management.commands.poll_gmail_orders.imaplib.IMAP4_SSL",
+            side_effect=[mail_a, mail_b],
+        ):
+            command._poll_all_restaurants()
+
+        self.assertEqual(Order.objects.filter(restaurant=restaurant_a).count(), 1)
+        self.assertEqual(Order.objects.filter(restaurant=restaurant_b).count(), 1)
+        self.assertEqual(
+            IncomingEmail.objects.filter(message_id="100", restaurant=restaurant_a).count(),
+            1,
+        )
+        self.assertEqual(
+            IncomingEmail.objects.filter(message_id="100", restaurant=restaurant_b).count(),
+            1,
+        )
+        self.assertEqual(Order.objects.filter(order_number="HB-SHARED").count(), 2)
+        self.assertEqual(mail_a.credentials[0], "a@example.com")
+        self.assertEqual(mail_b.credentials[0], "b@example.com")
+        self.assertEqual(mail_a.credentials[1], "tenant-app-password")
+        self.assertEqual(mail_b.credentials[1], "tenant-app-password")
+        connection_a.refresh_from_db()
+        connection_b.refresh_from_db()
+        self.assertEqual(connection_a.connection_status, RestaurantEmailConnection.ConnectionStatus.CONNECTED)
+        self.assertEqual(connection_b.connection_status, RestaurantEmailConnection.ConnectionStatus.CONNECTED)
+        self.assertIsNotNone(connection_a.last_checked_at)
+        self.assertTrue(mail_a.logged_out)
+        self.assertTrue(mail_b.logged_out)
+
+    def test_duplicate_within_one_tenant_is_idempotent(self):
+        restaurant = self._restaurant("Polling Duplicate", "polling-duplicate")
+        self._vendor(restaurant)
+        self._connection(restaurant, "duplicate@example.com")
+        command = Command()
+
+        with patch.object(command, "_legacy_food_costa_mailbox", return_value=None), patch(
+            "Orders.management.commands.poll_gmail_orders.imaplib.IMAP4_SSL",
+            side_effect=[
+                self.FakeMail(self._message("HB-DUPLICATE")),
+                self.FakeMail(self._message("HB-DUPLICATE")),
+            ],
+        ):
+            command._poll_all_restaurants()
+            command._poll_all_restaurants()
+
+        self.assertEqual(Order.objects.filter(restaurant=restaurant).count(), 1)
+        self.assertEqual(IncomingEmail.objects.filter(restaurant=restaurant).count(), 1)
+        self.assertEqual(Order.objects.get(restaurant=restaurant).items.count(), 1)
+
+    def test_failure_in_one_restaurant_does_not_block_the_next(self):
+        restaurant_a = self._restaurant("Failure A", "failure-a")
+        restaurant_b = self._restaurant("Failure B", "failure-b")
+        self._vendor(restaurant_a)
+        self._vendor(restaurant_b)
+        connection_a = self._connection(restaurant_a, "failure-a@example.com")
+        connection_b = self._connection(restaurant_b, "failure-b@example.com")
+        command = Command()
+
+        with patch.object(command, "_legacy_food_costa_mailbox", return_value=None), patch(
+            "Orders.management.commands.poll_gmail_orders.imaplib.IMAP4_SSL",
+            side_effect=[
+                self.FakeMail(None, imaplib.IMAP4.error("invalid credentials")),
+                self.FakeMail(self._message("HB-SECOND-SUCCEEDS")),
+            ],
+        ):
+            command._poll_all_restaurants()
+
+        connection_a.refresh_from_db()
+        connection_b.refresh_from_db()
+        self.assertEqual(connection_a.connection_status, RestaurantEmailConnection.ConnectionStatus.ERROR)
+        self.assertEqual(connection_b.connection_status, RestaurantEmailConnection.ConnectionStatus.CONNECTED)
+        self.assertEqual(Order.objects.filter(restaurant=restaurant_a).count(), 0)
+        self.assertEqual(Order.objects.filter(restaurant=restaurant_b).count(), 1)
+
+    def test_malformed_message_in_one_restaurant_does_not_block_the_next(self):
+        restaurant_a = self._restaurant("Malformed A", "malformed-a")
+        restaurant_b = self._restaurant("Malformed B", "malformed-b")
+        self._vendor(restaurant_a)
+        self._vendor(restaurant_b)
+        self._connection(restaurant_a, "malformed-a@example.com")
+        self._connection(restaurant_b, "malformed-b@example.com")
+        command = Command()
+        original_process_message = command._process_message
+        calls = 0
+
+        def fail_first_message(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("malformed vendor email")
+            return original_process_message(*args, **kwargs)
+
+        with patch.object(command, "_legacy_food_costa_mailbox", return_value=None), patch(
+            "Orders.management.commands.poll_gmail_orders.imaplib.IMAP4_SSL",
+            side_effect=[
+                self.FakeMail(self._message("HB-MALFORMED")),
+                self.FakeMail(self._message("HB-AFTER-MALFORMED")),
+            ],
+        ), patch.object(command, "_process_message", side_effect=fail_first_message):
+            command._poll_all_restaurants()
+
+        self.assertEqual(Order.objects.filter(restaurant=restaurant_a).count(), 0)
+        self.assertEqual(Order.objects.filter(restaurant=restaurant_b).count(), 1)
+
+    def test_only_access_eligible_restaurants_are_polled(self):
+        active = self._restaurant("Eligible Active", "eligible-active")
+        trial = Restaurant.objects.create(name="Eligible Trial", slug="eligible-trial")
+        expired = Restaurant.objects.create(
+            name="Expired", slug="expired", trial_ends_at=timezone.now() - timedelta(minutes=1)
+        )
+        suspended = self._restaurant(
+            "Suspended", "suspended", Restaurant.SubscriptionStatus.SUSPENDED
+        )
+        for restaurant in (active, trial, expired, suspended):
+            self._connection(restaurant, f"{restaurant.slug}@example.com")
+        command = Command()
+
+        with patch.object(command, "_legacy_food_costa_mailbox", return_value=None), patch.object(
+            command, "_poll_connection", return_value={"checked": 0}
+        ) as poll_connection:
+            command._poll_all_restaurants()
+
+        polled_ids = {call.args[0].restaurant_id for call in poll_connection.call_args_list}
+        self.assertEqual(polled_ids, {active.id, trial.id})
+
+    def test_suspended_and_expired_paid_restaurants_are_excluded_until_reactivated(self):
+        restaurant = self._restaurant("Renewable", "renewable")
+        connection = self._connection(restaurant, "renewable@example.com")
+        command = Command()
+
+        self.assertEqual(
+            [item.pk for item in command._eligible_connections()], [connection.pk]
+        )
+
+        restaurant.subscription_status = Restaurant.SubscriptionStatus.SUSPENDED
+        restaurant.save(update_fields=["subscription_status"])
+        self.assertEqual(command._eligible_connections(), [])
+
+        restaurant.subscription_status = Restaurant.SubscriptionStatus.ACTIVE
+        restaurant.subscription_ends_at = timezone.now() - timedelta(seconds=1)
+        restaurant.save(update_fields=["subscription_status", "subscription_ends_at"])
+        self.assertEqual(command._eligible_connections(), [])
+
+        restaurant.subscription_ends_at = timezone.now() + timedelta(days=30)
+        restaurant.save(update_fields=["subscription_ends_at"])
+        self.assertEqual(
+            [item.pk for item in command._eligible_connections()], [connection.pk]
+        )
+
+    def test_food_costa_legacy_fallback_and_backfill_are_tenant_scoped(self):
+        food_costa = Restaurant.objects.get(slug="food-costa")
+        command = Command()
+        with patch(
+            "Orders.management.commands.poll_gmail_orders.os.getenv",
+            side_effect=lambda key: {"GMAIL_EMAIL": "legacy@example.com", "GMAIL_APP_PASSWORD": "legacy-password"}.get(key),
+        ):
+            legacy = command._legacy_food_costa_mailbox(set())
+        self.assertEqual(legacy[0], food_costa)
+        self.assertEqual(legacy[1], "legacy@example.com")
+
+        restaurant_a = self._restaurant("Backfill A", "backfill-a")
+        restaurant_b = self._restaurant("Backfill B", "backfill-b")
+        vendor_a = self._vendor(restaurant_a)
+        vendor_b = self._vendor(restaurant_b)
+        IncomingEmail.objects.create(
+            restaurant=restaurant_a,
+            vendor=vendor_a,
+            message_id="same-backfill-id",
+            subject="A",
+            body="A",
+            received_at=timezone.now(),
+            processing_status=IncomingEmail.ProcessingStatus.FAILED,
+        )
+        IncomingEmail.objects.create(
+            restaurant=restaurant_b,
+            vendor=vendor_b,
+            message_id="same-backfill-id",
+            subject="B",
+            body="B",
+            received_at=timezone.now(),
+            processing_status=IncomingEmail.ProcessingStatus.FAILED,
+        )
+
+        stats = BackfillCommand()._retry_failed_messages(
+            ["same-backfill-id"], dry_run=True, restaurant=restaurant_a
+        )
+
+        self.assertEqual(stats["checked"], 1)
+        self.assertEqual(
+            IncomingEmail.objects.filter(
+                restaurant=restaurant_b,
+                message_id="same-backfill-id",
+                processing_status=IncomingEmail.ProcessingStatus.FAILED,
+            ).count(),
+            1,
+        )
+
+
 class GmailBackfillCommandTests(TestCase):
     def setUp(self):
+        self.restaurant = Restaurant.objects.get(slug="food-costa")
         self.vendor = Vendor.objects.create(
-            name="HomeBytes", email_address="info@homebytes.co.in"
+            restaurant=self.restaurant,
+            name="HomeBytes", email_address="info@homebytes.co.in",
+            parser_type=Vendor.ParserType.HOMEBYTES,
         )
 
     def _body(self, order_number, order_day):
@@ -1500,6 +2953,7 @@ class GmailBackfillCommandTests(TestCase):
     def test_existing_received_email_without_order_is_retried(self):
         historical_day = date(2026, 8, 5)
         IncomingEmail.objects.create(
+            restaurant=self.restaurant,
             message_id="8002",
             vendor=self.vendor,
             subject="Existing",
@@ -1539,6 +2993,7 @@ class GmailBackfillCommandTests(TestCase):
     def test_existing_failed_email_without_order_is_retried(self):
         historical_day = date(2026, 8, 5)
         IncomingEmail.objects.create(
+            restaurant=self.restaurant,
             message_id="8007",
             vendor=self.vendor,
             subject="Failed",
@@ -1567,6 +3022,7 @@ class GmailBackfillCommandTests(TestCase):
         historical_day = date(2026, 8, 5)
         body = self._body("HB-PROCESSED", historical_day)
         incoming_email = IncomingEmail.objects.create(
+            restaurant=self.restaurant,
             message_id="8008",
             vendor=self.vendor,
             subject="Processed",
@@ -1632,7 +3088,7 @@ class GmailBackfillCommandTests(TestCase):
         self.assertEqual(stats["orders"], 1)
         self.assertEqual(
             IncomingEmail.objects.get(message_id="8004").processing_status,
-            IncomingEmail.ProcessingStatus.FAILED,
+            IncomingEmail.ProcessingStatus.INVALID,
         )
         self.assertTrue(Order.objects.filter(order_number="HB-GOOD").exists())
 
@@ -1669,6 +3125,7 @@ class GmailBackfillCommandTests(TestCase):
             <table><tr><td>1</td><td>Veg Cheese Pizza</td><td></td><td>1</td><td>300.00</td><td>15.00</td><td>300.00</td></tr></table>
         """
         IncomingEmail.objects.create(
+            restaurant=self.restaurant,
             message_id="8010",
             vendor=self.vendor,
             subject="Failed historical order",
@@ -1694,7 +3151,9 @@ class GmailBackfillCommandTests(TestCase):
 
 class EmailClassificationCommandTests(TestCase):
     def setUp(self):
+        self.restaurant = Restaurant.objects.get(slug="food-costa")
         self.vendor = Vendor.objects.create(
+            restaurant=self.restaurant,
             name="RailRestro", email_address="no-reply@railrestro.com"
         )
 

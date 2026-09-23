@@ -1,0 +1,78 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Train Food Order Management Software &amp; Railway Restaurant POS | TrainPOS</title>
+  <meta name="description" content="TrainPOS helps railway and eCatering restaurants automatically receive train food orders, track live train ETA, print bills and monitor COD and prepaid sales. Start a 15-day free trial.">
+  <meta name="robots" content="index,follow">
+  <link rel="canonical" href="{{ site_url }}/">
+  <link rel="icon" href="{% static 'Orders/img/trainpos-mark.svg' %}" type="image/svg+xml">
+  <meta property="og:title" content="Train Food Order Management Software | TrainPOS">
+  <meta property="og:description" content="One dashboard for railway food orders, live train ETA, thermal billing and sales reports.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="{{ site_url }}/">
+  <meta property="og:image" content="{{ site_url }}/static/Orders/img/trainpos-social.svg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Train Food Order Management Software | TrainPOS">
+  <meta name="twitter:description" content="One dashboard for railway food orders, live train ETA, thermal billing and sales reports.">
+  <link rel="stylesheet" href="{% static 'Orders/css/public.css' %}">
+  <link rel="stylesheet" href="{% static 'Orders/css/landing-v2.css' %}">
+  <script type="application/ld+json">{{ organization_json|safe }}</script>
+  <script type="application/ld+json">{{ application_json|safe }}</script>
+</head>
+<body class="landing">
+  <header class="public-header">
+    <nav class="public-nav" aria-label="Primary navigation">
+      <a class="public-brand" href="{% url 'landing' %}" aria-label="TrainPOS home">{% include 'Orders/partials/brand_logo.html' %}</a>
+      <div class="nav-links">
+        <a href="#features">Features</a><a href="#live-tracking">Live Tracking</a><a href="#reports">Reports</a><a href="#how-it-works">How It Works</a><a href="#pricing">Pricing</a><a href="#faq">FAQ</a>
+      </div>
+      <div class="nav-actions"><a class="login-link" href="{% url 'login' %}">Login</a><a class="button button-small" href="{% url 'signup' %}">Start Free Trial</a></div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero hero-v2" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow">Railway &amp; eCatering Order Management</p>
+        <h1 id="hero-title">Run Every Train Food Order <span>From One Dashboard.</span></h1>
+        <p class="hero-seo-line">Train Food Order Management Software for Railway Restaurants</p>
+        <p class="hero-description">Automatically receive railway eCatering orders, see when trains are actually arriving, print bills and track COD and prepaid sales — all from one place.</p>
+        <div class="hero-actions"><a class="button" href="{% url 'signup' %}">Start 15-Day Free Trial <span aria-hidden="true">→</span></a><a class="text-link" href="#how-it-works">See How It Works <span aria-hidden="true">↓</span></a></div>
+        <div class="price-note"><strong>₹5,999/year</strong><span>Effectively only ₹500/month</span><small>15-day free trial <b>·</b> No card required</small></div>
+      </div>
+      <div class="product-mockup product-mockup-v2" aria-label="Illustration of the TrainPOS order dashboard">
+        <div class="mockup-browser"><span></span><span></span><span></span><p>app.trainpos.in <b>●</b></p></div>
+        <div class="mockup-appbar"><div><b>TrainPOS</b><span>Today’s Orders</span></div><span class="mockup-live"><i></i> Live operations</span></div>
+        <div class="mockup-content-v2">
+          <div class="mockup-heading"><div><small>Incoming railway order</small><b>#RR-5773443</b></div><span class="mockup-badge">NEW</span></div>
+          <div class="mockup-order-card"><div class="order-main"><div class="order-vendor"><span>R</span><div><b>RailRestro</b><small>12963 · Mewar Express</small></div></div><div class="order-details"><span>Passenger</span><b>B2 / 36</b><span>Payment</span><b class="cod-badge">COD</b></div><div class="order-total"><span>Order total</span><b>₹546</b></div></div><div class="eta-panel"><div><span>ETA GGC</span><strong>7:42 PM</strong></div><div><span>Delay</span><strong class="delay">+18 min</strong></div><div><span>Arriving in</span><strong>26 min</strong></div></div><div class="order-actions"><span><i></i> Live train status</span><button type="button">⌁ Print Bill</button></div></div>
+          <div class="mockup-secondary-order"><span class="secondary-dot"></span><div><b>#HB-001260544</b><small>HomeBytes · Online payment</small></div><span>Expected arrival available</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="value-strip" aria-label="TrainPOS capabilities"><div><span>↧</span>Automatic Order Capture</div><div><span>◷</span>Live Train ETA</div><div><span>⇄</span>Multiple Railway Vendors</div><div><span>▤</span>Thermal Bill Printing</div><div><span>▥</span>Sales Reports</div></section>
+
+    <section class="section pain-section"><p class="section-kicker">A clearer daily operation</p><h2>Still checking multiple portals, emails and train status apps?</h2><div class="pain-grid"><article><span>01</span><h3>Orders scattered everywhere</h3><p>Different railway food vendors, emails and screens make restaurant operations harder than they need to be.</p></article><article><span>02</span><h3>Train timing keeps changing</h3><p>Scheduled arrival time is not enough when the train is running late.</p></article><article><span>03</span><h3>Business numbers are unclear</h3><p>COD, prepaid and vendor-wise sales often require manual calculation.</p></article></div><p class="bridge-copy">TrainPOS brings orders, train intelligence and business reporting into one place.</p></section>
+
+    <section class="section features-section" id="features"><div class="section-heading"><p class="section-kicker">Core workflow</p><h2>Built around the railway food order journey</h2><p>One focused railway restaurant software workspace, from incoming order to bill and sales visibility.</p></div><div class="feature-grid"><article class="feature-card"><span class="feature-icon">↧</span><h3>Automatic Train Order Capture</h3><p>Supported eCatering order emails are converted into structured TrainPOS orders automatically.</p></article><article class="feature-card"><span class="feature-icon">◷</span><h3>Live Train ETA at Your Station</h3><p>See expected arrival time, delay and how long remains before the train reaches your delivery station.</p></article><article class="feature-card"><span class="feature-icon">⇄</span><h3>One Dashboard for Multiple Vendors</h3><p>Manage supported railway food-order providers from one operational screen instead of switching between systems.</p></article><article class="feature-card"><span class="feature-icon">▤</span><h3>Fast Thermal Bill Printing</h3><p>Print compact restaurant bills with order, passenger, payment and item details.</p></article><article class="feature-card"><span class="feature-icon">▥</span><h3>Clear Business Reports</h3><p>View today, yesterday, weekly, monthly or custom-period sales with COD, prepaid and vendor breakdowns.</p></article><article class="feature-card"><span class="feature-icon">●</span><h3>New Orders Appear Automatically</h3><p>TrainPOS detects newly received orders while the dashboard is open, so your team does not need to keep refreshing the page.</p></article></div></section>
+
+    <section class="section train-section" id="live-tracking"><div class="train-visual"><div class="tracking-train"><b>12963</b><span>Mewar Express</span><i>Live when available</i></div><div class="tracking-times"><div><span>Scheduled</span><strong>7:24 PM</strong></div><div><span>Expected</span><strong>7:42 PM</strong></div><div><span>Delay</span><strong>+18 min</strong></div><div><span>Arriving In</span><strong>26 min</strong></div></div><div class="route-line"><i></i><i></i><i class="active"></i><i></i></div><p>ETA and delay context, beside the order your team is preparing.</p></div><div><p class="section-kicker">Train intelligence</p><h2>Know When the Train Is Actually Arriving.</h2><p>Scheduled time is only the starting point. TrainPOS brings live arrival information beside the food order so your team can prepare around the train’s actual movement.</p><p>Live train data can occasionally be unavailable, so the dashboard keeps the operational order details clear either way.</p></div></section>
+
+    <section class="section how-section" id="how-it-works"><p class="section-kicker">Simple, practical setup</p><h2>From Email to Ready-to-Serve Order</h2><div class="steps"><article><b>01</b><h3>Create Your Restaurant Account</h3></article><article><b>02</b><h3>Connect Your Order Gmail</h3></article><article><b>03</b><h3>TrainPOS Automatically Organizes Supported Orders</h3></article><article><b>04</b><h3>Track, Prepare, Print and Report</h3></article></div><p class="section-note">Setup is designed to be simple, with no complicated restaurant hardware required to start.</p></section>
+
+    <section class="section reporting-section" id="reports"><div><p class="section-kicker">Sales clarity</p><h2>Know exactly how your railway-food business performed.</h2><p>Use date ranges to understand total orders, COD value, prepaid/online value, net sales and vendor breakdowns—without manual calculation.</p></div><div class="report-card"><span>Sales reporting</span><strong>COD · Online · Vendor view</strong><p>Today, yesterday, week, month or a custom period.</p></div></section>
+
+    <section class="section pricing-section" id="pricing"><p class="section-kicker">Straightforward pricing</p><h2>One plan for your railway food operation</h2><article class="pricing-card"><div><p class="plan-name">TRAINPOS ANNUAL</p><p class="price">₹5,999 <small>/ year</small></p><p class="monthly">Effectively only ₹500/month</p><p class="trial-copy">15-day free trial · No payment required to start</p></div><ul><li>Automatic supported-order capture</li><li>Multi-vendor order dashboard</li><li>Live train ETA and delay</li><li>New-order detection</li><li>Thermal bill printing</li><li>COD / prepaid and vendor-wise reporting</li><li>Daily, weekly, monthly and custom reports</li><li>Demo capability and software updates</li></ul><div class="pricing-action"><a class="button" href="{% url 'signup' %}">Start Free Trial</a><small>After your trial, contact TrainPOS to activate the annual subscription.</small></div></article></section>
+
+    <section class="section faq-section" id="faq"><p class="section-kicker">Questions, answered</p><h2>Frequently asked questions</h2><div class="faq-list"><details><summary>What is TrainPOS?</summary><p>TrainPOS is train food order management software for railway and eCatering restaurants, combining automatic order capture, live train ETA, billing and sales reports in one dashboard.</p></details><details><summary>Who is TrainPOS built for?</summary><p>It is built for restaurants that receive food orders for passengers travelling by train.</p></details><details><summary>Can TrainPOS manage orders from multiple railway food platforms?</summary><p>TrainPOS brings supported railway food-order provider emails into one operational dashboard.</p></details><details><summary>How does TrainPOS receive eCatering orders?</summary><p>After a restaurant connects its order Gmail, supported order emails can be captured and organized into TrainPOS orders.</p></details><details><summary>Does TrainPOS show live train arrival information?</summary><p>When train data is available, TrainPOS can show expected arrival, delay and arriving-in information for the delivery station.</p></details><details><summary>Can I track COD and prepaid railway food orders separately?</summary><p>Yes. Reports distinguish COD and prepaid/online value alongside other sales information.</p></details><details><summary>Does TrainPOS print bills?</summary><p>Yes. TrainPOS includes compact thermal bill printing with order, passenger, payment and item details.</p></details><details><summary>How much does TrainPOS cost?</summary><p>TrainPOS costs ₹5,999 per year, effectively ₹500 per month.</p></details><details><summary>Is there a free trial?</summary><p>Yes. New restaurants receive a 15-day free trial with no card required to begin.</p></details><details><summary>Do I need special hardware?</summary><p>No complicated restaurant hardware is required to start. Thermal bill printing works with a compatible printer and browser setup.</p></details></div></section>
+
+    <section class="final-cta"><div><p class="section-kicker">Ready when you are</p><h2>Stop Managing Train Food Orders Manually.</h2><p>Bring orders, live train timing, billing and sales visibility into one TrainPOS dashboard.</p></div><div><a class="button button-light" href="{% url 'signup' %}">Start 15-Day Free Trial</a><a class="final-login" href="{% url 'login' %}">Login</a><small>₹5,999/year · effectively ₹500/month</small></div></section>
+  </main>
+
+  <footer class="public-footer"><div class="footer-inner"><div><a class="public-brand footer-brand" href="{% url 'landing' %}">{% include 'Orders/partials/brand_logo.html' %}</a><p>TrainPOS is train food order management software for railway and eCatering restaurants.</p></div><div class="footer-links"><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#faq">FAQ</a><a href="{% url 'login' %}">Login</a><a href="{% url 'signup' %}">Start Free Trial</a></div><address>{% if trainpos_contact_phone %}<span>{{ trainpos_contact_phone }}</span>{% endif %}{% if trainpos_contact_email %}<a href="mailto:{{ trainpos_contact_email }}">{{ trainpos_contact_email }}</a>{% endif %}{% if trainpos_contact_whatsapp %}<span>WhatsApp: {{ trainpos_contact_whatsapp }}</span>{% endif %}</address></div><p class="copyright">© {% now "Y" %} TrainPOS</p></footer>
+</body>
+</html>

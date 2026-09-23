@@ -5,13 +5,20 @@ from datetime import date, timedelta
 from email.utils import parseaddr
 
 from django.core.management.base import BaseCommand, CommandError
+from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 
-from Orders.management.commands.poll_gmail_orders import GMAIL_HOST, GMAIL_PORT, PARSERS
-from Orders.models import IncomingEmail, Vendor
+from Orders.management.commands.poll_gmail_orders import GMAIL_HOST, GMAIL_PORT
+from Orders.models import IncomingEmail, Restaurant, RestaurantEmailConnection, Vendor
 from Orders.services.email_classification import ORDER, classify_vendor_email
+from Orders.services.email_failures import (
+    is_terminal_parser_or_validation_error,
+    sanitized_error_message,
+)
 from Orders.services.gmail_email import decode_subject, extract_body, get_received_at
 from Orders.services.order_creation import create_order_from_incoming_email
+from Orders.services.tenancy import get_food_costa_restaurant
+from Orders.services.vendor_parsers import get_vendor_parser
 
 
 class Command(BaseCommand):
@@ -20,6 +27,10 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--from-date", help="Start date in YYYY-MM-DD format.")
         parser.add_argument("--to-date", help="End date in YYYY-MM-DD format.")
+        parser.add_argument(
+            "--restaurant-slug",
+            help="Backfill exactly one authorized restaurant mailbox. Defaults to Food Costa for legacy compatibility.",
+        )
         parser.add_argument(
             "--dry-run",
             action="store_true",
@@ -33,19 +44,17 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        restaurant = self._restaurant_for_backfill(options["restaurant_slug"])
         retry_message_ids = options["retry_failed_message_id"]
         if retry_message_ids:
-            stats = self._retry_failed_messages(retry_message_ids, options["dry_run"])
+            stats = self._retry_failed_messages(
+                retry_message_ids, options["dry_run"], restaurant
+            )
             self._write_retry_summary(retry_message_ids, stats, options["dry_run"])
             return
 
         start_date, end_date = self._date_range(options["from_date"], options["to_date"])
-        email_address = os.getenv("GMAIL_EMAIL")
-        app_password = os.getenv("GMAIL_APP_PASSWORD")
-        if not email_address or not app_password:
-            raise CommandError(
-                "Set GMAIL_EMAIL and GMAIL_APP_PASSWORD in .env before backfilling Gmail."
-            )
+        email_address, app_password = self._mailbox_credentials(restaurant)
 
         stats = self._backfill(
             email_address,
@@ -53,8 +62,45 @@ class Command(BaseCommand):
             start_date,
             end_date,
             options["dry_run"],
+            restaurant,
         )
         self._write_summary(start_date, end_date, stats, options["dry_run"])
+
+    def _restaurant_for_backfill(self, restaurant_slug):
+        if not restaurant_slug:
+            return get_food_costa_restaurant()
+        try:
+            restaurant = Restaurant.objects.get(slug=restaurant_slug)
+        except Restaurant.DoesNotExist as error:
+            raise CommandError("Restaurant was not found.") from error
+        if not restaurant.has_access:
+            raise CommandError("This restaurant does not have product access.")
+        return restaurant
+
+    def _mailbox_credentials(self, restaurant):
+        connection = (
+            RestaurantEmailConnection.objects.filter(
+                restaurant=restaurant,
+                is_active=True,
+                encrypted_app_password__gt="",
+            )
+            .order_by("id")
+            .first()
+        )
+        if connection:
+            try:
+                return connection.email_address, connection.get_app_password()
+            except (ImproperlyConfigured, ValueError) as error:
+                raise CommandError("Restaurant Gmail credentials are unavailable.") from error
+
+        if restaurant.slug == "food-costa":
+            email_address = os.getenv("GMAIL_EMAIL")
+            app_password = os.getenv("GMAIL_APP_PASSWORD")
+            if email_address and app_password:
+                return email_address, app_password
+        raise CommandError(
+            "This restaurant needs an active Gmail connection before backfill can run."
+        )
 
     def _date_range(self, from_date, to_date):
         if not from_date or not to_date:
@@ -68,7 +114,8 @@ class Command(BaseCommand):
             raise CommandError("--from-date cannot be later than --to-date.")
         return start_date, end_date
 
-    def _retry_failed_messages(self, message_ids, dry_run):
+    def _retry_failed_messages(self, message_ids, dry_run, restaurant=None):
+        restaurant = restaurant or get_food_costa_restaurant()
         stats = {
             "checked": 0,
             "vendor_emails": 0,
@@ -79,6 +126,7 @@ class Command(BaseCommand):
             "failures": 0,
         }
         incomplete_messages = IncomingEmail.objects.filter(
+            restaurant=restaurant,
             message_id__in=message_ids,
             order__isnull=True,
             processing_status__in=[
@@ -113,7 +161,10 @@ class Command(BaseCommand):
             self._create_order_from_incoming_email(incoming_email, stats)
         return stats
 
-    def _backfill(self, email_address, app_password, start_date, end_date, dry_run):
+    def _backfill(
+        self, email_address, app_password, start_date, end_date, dry_run, restaurant=None
+    ):
+        restaurant = restaurant or get_food_costa_restaurant()
         stats = {
             "checked": 0,
             "vendor_emails": 0,
@@ -136,7 +187,7 @@ class Command(BaseCommand):
             stats["checked"] = len(message_uids)
             for message_uid in message_uids:
                 self._process_message(
-                    mail, message_uid, stats, start_date, end_date, dry_run
+                    mail, message_uid, stats, start_date, end_date, dry_run, restaurant
                 )
         except (imaplib.IMAP4.error, OSError) as error:
             stats["failures"] += 1
@@ -162,7 +213,10 @@ class Command(BaseCommand):
             raise imaplib.IMAP4.error("Unable to search the INBOX.")
         return messages[0].split()
 
-    def _process_message(self, mail, message_uid, stats, start_date, end_date, dry_run):
+    def _process_message(
+        self, mail, message_uid, stats, start_date, end_date, dry_run, restaurant=None
+    ):
+        restaurant = restaurant or get_food_costa_restaurant()
         message_id = message_uid.decode()
         status, message_data = mail.uid(
             "fetch",
@@ -181,26 +235,33 @@ class Command(BaseCommand):
             return
 
         sender_email = parseaddr(header_message.get("From", ""))[1].lower()
-        vendor = Vendor.objects.filter(email_address__iexact=sender_email).first()
+        vendor = Vendor.objects.filter(
+            restaurant=restaurant,
+            email_address__iexact=sender_email,
+            is_active=True,
+        ).first()
         if vendor is None:
             return
         stats["vendor_emails"] += 1
         subject = decode_subject(header_message.get("Subject"))
 
         incoming_email = (
-            IncomingEmail.objects.filter(message_id=message_id)
+            IncomingEmail.objects.filter(restaurant=restaurant, message_id=message_id)
             .select_related("vendor")
             .first()
         )
         if classify_vendor_email(vendor, subject) != ORDER:
             self._store_non_order_email(
-                mail, message_uid, message_id, vendor, subject, incoming_email, stats, dry_run
+                mail, message_uid, message_id, vendor, subject, incoming_email, stats, dry_run, restaurant
             )
             return
         if incoming_email is not None:
             if incoming_email.order_id:
                 stats["skipped"] += 1
                 self.stdout.write(f"[SKIP] Already successfully ingested - {message_id}")
+                return
+            if incoming_email.processing_status == IncomingEmail.ProcessingStatus.INVALID:
+                self._skip_invalid_email(incoming_email, stats)
                 return
             stats["existing_retried"] += 1
             if dry_run:
@@ -230,6 +291,7 @@ class Command(BaseCommand):
 
         message = email.message_from_bytes(message_data[0][1])
         incoming_email, created = IncomingEmail.objects.get_or_create(
+            restaurant=restaurant,
             message_id=message_id,
             defaults={
                 "vendor": vendor,
@@ -245,6 +307,9 @@ class Command(BaseCommand):
             if incoming_email.order_id:
                 stats["skipped"] += 1
                 self.stdout.write(f"[SKIP] Already successfully ingested - {message_id}")
+                return
+            if incoming_email.processing_status == IncomingEmail.ProcessingStatus.INVALID:
+                self._skip_invalid_email(incoming_email, stats)
                 return
             stats["existing_retried"] += 1
             if classify_vendor_email(
@@ -264,7 +329,7 @@ class Command(BaseCommand):
         self._create_order_from_incoming_email(incoming_email, stats)
 
     def _store_non_order_email(
-        self, mail, message_uid, message_id, vendor, subject, incoming_email, stats, dry_run
+        self, mail, message_uid, message_id, vendor, subject, incoming_email, stats, dry_run, restaurant
     ):
         if dry_run:
             stats["skipped"] += 1
@@ -280,6 +345,7 @@ class Command(BaseCommand):
                 return
             message = email.message_from_bytes(message_data[0][1])
             incoming_email, _ = IncomingEmail.objects.get_or_create(
+                restaurant=restaurant,
                 message_id=message_id,
                 defaults={
                     "vendor": vendor,
@@ -307,15 +373,24 @@ class Command(BaseCommand):
         stats["skipped"] += 1
         self.stdout.write(f"[SKIP] Non-order status update - {incoming_email.message_id}")
 
+    def _skip_invalid_email(self, incoming_email, stats):
+        stats["skipped"] += 1
+        self.stdout.write(f"[SKIP] Invalid email - {incoming_email.message_id}")
+
     def _create_order_from_incoming_email(self, incoming_email, stats):
         try:
             order = create_order_from_incoming_email(
-                incoming_email, PARSERS[incoming_email.vendor.name](incoming_email.body)
+                incoming_email, get_vendor_parser(incoming_email.vendor)(incoming_email.body)
             )
         except Exception as error:
+            processing_status = (
+                IncomingEmail.ProcessingStatus.INVALID
+                if is_terminal_parser_or_validation_error(error)
+                else IncomingEmail.ProcessingStatus.FAILED
+            )
             IncomingEmail.objects.filter(pk=incoming_email.pk, order__isnull=True).update(
-                processing_status=IncomingEmail.ProcessingStatus.FAILED,
-                error_message=str(error),
+                processing_status=processing_status,
+                error_message=sanitized_error_message(error),
             )
             stats["failures"] += 1
             self.stderr.write(

@@ -20,6 +20,13 @@ from django.urls import include, path
 from Orders import views as order_views
 
 urlpatterns = [
+    path('', order_views.landing, name='landing'),
+    path('robots.txt', order_views.robots_txt, name='robots_txt'),
+    path('sitemap.xml', order_views.sitemap_xml, name='sitemap_xml'),
+    path('signup/', order_views.signup, name='signup'),
+    path('login/', order_views.login_view, name='login'),
+    path('logout/', order_views.logout_view, name='logout'),
+    path('onboarding/email/', order_views.onboarding_email, name='onboarding_email'),
     path('admin/', admin.site.urls),
     path('orders/', include('Orders.urls')),
     path('reports/', order_views.reports, name='reports'),

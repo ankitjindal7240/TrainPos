@@ -4,6 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
   <meta name="csrf-token" content="{{ csrf_token }}">
   <title>TrainPOS Orders</title>
   <link rel="stylesheet" href="{% static 'Orders/css/order_list.css' %}">
@@ -12,18 +13,15 @@
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="{% url 'order_list' %}"><span class="brand-mark">▣</span>TrainPOS</a>
-      <div class="account"><span class="account-icon">⌂</span><span><strong>Food Costa</strong><small>Admin</small></span></div>
+      <details class="account-menu">
+        <summary><span class="account-icon">⌂</span><span><strong>{{ request.user.get_full_name|default:request.user.username }}</strong><small>{{ restaurant.name }}</small></span><b>⌄</b></summary>
+        <div class="account-dropdown"><strong>{{ restaurant.name }}</strong>{% if can_manage_email %}<a href="{% url 'onboarding_email' %}">Manage Gmail</a>{% endif %}{% if request.user.is_superuser %}<a href="{% url 'admin:index' %}">Platform Admin</a>{% endif %}<form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Log out</button></form></div>
+      </details>
       <nav class="side-nav" aria-label="Main navigation">
-        <span class="nav-item">▦ <span>Dashboard</span></span>
         <a class="nav-item active" href="{% url 'order_list' %}">▤ <span>Orders</span></a>
-        <span class="nav-item">♧ <span>KOT</span></span>
-        <span class="nav-item">♙ <span>Customers</span></span>
-        <span class="nav-item">▧ <span>Trains</span></span>
-        <span class="nav-item">▣ <span>Vendors</span></span>
         <a class="nav-item" href="{% url 'reports' %}">▥ <span>Reports</span></a>
-        <span class="nav-item">⚙ <span>Settings</span></span>
+        {% if can_manage_email %}<a class="nav-item" href="{% url 'onboarding_email' %}">✉ <span>Gmail Settings</span></a>{% endif %}
       </nav>
-      <span class="collapse-menu">‹ <span>Collapse Menu</span></span>
     </aside>
 
     <main class="main-content">
@@ -31,14 +29,16 @@
       <div id="order-dashboard-poll" data-url="{% url 'order_dashboard_version' %}" data-token="{{ dashboard_version.token }}"></div>
       <header class="topbar">
         <div><h1>Orders</h1><p>Manage all incoming orders</p></div>
-        <div class="topbar-tools" aria-label="Visual controls">
-          <span class="search-placeholder">Search orders, PNR, phone, train... <b>⌕</b></span>
-          <span class="tool-button">☷</span>
-          <span class="date-placeholder">▣ {{ dashboard_date|date:"d M Y" }}</span>
-          <span class="bell">♧<i>12</i></span>
-          <span class="profile">A</span><span class="admin-label">Admin⌄</span>
-        </div>
       </header>
+
+      {% if restaurant.subscription_status == "TRIAL" %}
+        <div class="trial-banner">Free trial: {{ restaurant.trial_days_remaining }} day{{ restaurant.trial_days_remaining|pluralize }} remaining</div>
+      {% elif restaurant.subscription_status == "ACTIVE" and restaurant.subscription_ends_at %}
+        <div class="trial-banner">Subscription active until {{ restaurant.subscription_ends_at|date:"d M Y" }}</div>
+      {% endif %}
+      {% if not has_active_email_connection %}
+        <div class="setup-reminder">Order email setup is not complete.{% if can_manage_email %} <a href="{% url 'onboarding_email' %}">Connect your Gmail</a>{% else %} Please ask your restaurant owner to complete setup.{% endif %}</div>
+      {% endif %}
 
       <section class="summary-grid" aria-label="Order summary">
         <article class="summary-card"><span class="summary-icon total">▥</span><div><strong>{{ summary.total_orders }}</strong><small>Total Orders</small></div></article>
@@ -76,7 +76,7 @@
                     <td><button class="expand-button" type="button" aria-expanded="false" aria-controls="order-detail-{{ order.id }}" data-detail-id="order-detail-{{ order.id }}">⌄</button></td>
                     <td><span class="status-badge status-{{ order.status|lower }}">{{ order.get_status_display }}</span></td>
                     <td class="order-id">{{ order.order_number }}</td>
-                    <td>{{ order.vendor.name }}</td>
+                    <td>{{ order.vendor.name }}{% if order.is_demo %}<span class="demo-badge">DEMO</span>{% endif %}</td>
                     <td>{% if schedule %}{{ schedule|date:"d-m-Y" }}{% else %}—{% endif %}</td>
                     <td>{% if schedule %}{{ schedule|date:"H:i" }}{% else %}—{% endif %}</td>
                     <td>{% if order.payment_mode == 'CASH_ON_DELIVERY' %}<span class="payment-badge cod">COD</span>{% else %}<span class="payment-badge online">ONLINE</span>{% endif %}</td>
@@ -88,7 +88,7 @@
                       <td class="live-arriving urgency-{{ live.urgency|lower }}" data-live-arriving data-train-run="{{ order.live_train_run_key }}"><b data-arriving-value>{% if live.available %}{% if live.display_state == "LIVE" %}{{ live.arriving_in|default:"—" }}{% elif live.display_state == "NOT_STARTED" %}—{% else %}Reached{% endif %}{% else %}—{% endif %}</b></td>
                     {% endwith %}
                     <td>—</td>
-                    <td><span class="actions"><button type="button" aria-label="Send order">➤</button><a class="bill-button{% if order.bill_printed %} bill-printed{% endif %}" href="{% url 'order_bill' order.pk %}" target="_blank" aria-label="Print bill"{% if order.bill_printed %} title="Bill already printed"{% endif %}>{% if order.bill_printed %}✓{% else %}▣{% endif %}</a><button type="button" aria-label="KOT">KOT</button><button type="button" aria-label="Edit order">✎</button></span></td>
+                    <td><span class="actions"><a class="bill-button{% if order.bill_printed %} bill-printed{% endif %}" href="{% url 'order_bill' order.pk %}" target="_blank" aria-label="Print bill"{% if order.bill_printed %} title="Bill already printed"{% endif %}>{% if order.bill_printed %}✓{% else %}▣{% endif %}</a></span></td>
                   </tr>
                   <tr class="order-detail-row" id="order-detail-{{ order.id }}" hidden>
                     <td colspan="14">
